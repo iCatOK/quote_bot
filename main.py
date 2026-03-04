@@ -1,30 +1,44 @@
 import asyncio
+import gc
+import hashlib
+import json
 import logging
 import os
+import resource
 import tempfile
-import textwrap
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
-# --- not need in production, but makes local dev easier without env vars ---
 from dotenv import load_dotenv
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 
 # ─────────────────────────── config ───────────────────────────
 
-# --- uncomment if using .env file for local development ---
 load_dotenv()
 
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
+
+SUPERCHAT_TO_THREAD_MAP = {
+    -1002692670592: 188271,
+    -1003721142275: 2
+}
+
 QUOTE_THREAD_ID: int = int(os.environ["QUOTE_THREAD_ID"])
 
 FONT_DIR = Path("./fonts")
 FONT_PATH = FONT_DIR / "Caveat-Bold.ttf"
 FONT_URL = "https://github.com/googlefonts/caveat/raw/main/fonts/ttf/Caveat-Bold.ttf"
+
+# Директория кэша фонов аватаров
+BG_CACHE_DIR = Path("./bg_cache")
+BG_CACHE_META = BG_CACHE_DIR / "_meta.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,9 +46,95 @@ logging.basicConfig(
 )
 log = logging.getLogger("quote_bot")
 
-# ─────────────────────────── font bootstrap ───────────────────────────
+# ─────────────────────────── constants ────────────────────────
+
+IMG_WIDTH = 1280
+IMG_MIN_HEIGHT = 720
+IMG_MAX_HEIGHT = 1600
+PAD_X = 110
+PAD_TOP = 120
+PAD_BOTTOM = 100
+LINE_SPACING_FACTOR = 1.40
+
+BG_COLOR = (10, 10, 10)
+TEXT_COLOR = (248, 245, 240)
+AUTHOR_COLOR = (240, 233, 223)
+QUOTE_MARK_ALPHA = 60
+
+DARKEN_FACTOR = 0.6
+
+# ── Лимит символов цитаты (≈ 3–5 строк при шрифте 92, гарантированный fit) ──
+MAX_QUOTE_LENGTH = 500
+
+# ── Семафор: максимум 2 одновременных генерации изображений ──
+# На 0.5 ГБ ОЗУ и 1 ядре — больше 2 одновременно = OOM-риск.
+# Одно RGBA-изображение 1280×1600 = ~8 МБ, плюс промежуточные слои ≈30 МБ.
+IMAGE_GEN_SEMAPHORE = asyncio.Semaphore(2)
+
+# ── ThreadPoolExecutor с 1 воркером (1 ядро → больше нет смысла) ──
+# Pillow GIL-free для тяжёлых C-операций (resize, enhance), поэтому
+# один поток в executor уже разблокирует event loop.
+IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="img_gen")
+
+
+# ─────────────────────────── profiling helpers ────────────────
+
+def _get_memory_mb() -> float:
+    """Текущий RSS процесса в МБ (Linux/macOS)."""
+    try:
+        # resource.getrusage возвращает ru_maxrss в КБ на Linux, в байтах на macOS
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        rss_kb = usage.ru_maxrss
+        # На Linux ru_maxrss в КБ, на macOS в байтах
+        if os.uname().sysname == "Darwin":
+            return rss_kb / 1024 / 1024
+        return rss_kb / 1024
+    except Exception:
+        return 0.0
+
+
+def _get_rss_mb() -> float:
+    """Текущий RSS через /proc/self/status (точнее для Linux)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024  # KБ → МБ
+    except Exception:
+        pass
+    return _get_memory_mb()
+
+
+class PerfTimer:
+    """Контекстный менеджер для профилирования блоков кода."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.start_time = 0.0
+        self.start_cpu = 0.0
+        self.start_rss = 0.0
+
+    def __enter__(self):
+        self.start_rss = _get_rss_mb()
+        self.start_cpu = time.process_time()
+        self.start_time = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        elapsed = time.perf_counter() - self.start_time
+        cpu_used = time.process_time() - self.start_cpu
+        end_rss = _get_rss_mb()
+        delta_rss = end_rss - self.start_rss
+        log.info(
+            "⏱ [%s] wall=%.3fs cpu=%.3fs RSS=%.1fMB (Δ%+.1fMB)",
+            self.label, elapsed, cpu_used, end_rss, delta_rss,
+        )
+        return False
+
+
+# ─────────────────────────── font bootstrap ───────────────────
+
 def ensure_font() -> None:
-    """Download Caveat-Bold.ttf once on first launch."""
     FONT_DIR.mkdir(exist_ok=True)
     if FONT_PATH.exists():
         log.info("Font already present: %s", FONT_PATH)
@@ -44,37 +144,135 @@ def ensure_font() -> None:
     log.info("Font saved to %s", FONT_PATH)
 
 
-# ─────────────────────────── image generation ───────────────────────────
-# Design constants
-IMG_WIDTH = 1280
-IMG_MIN_HEIGHT = 720
-IMG_MAX_HEIGHT = 1600
-PAD_X = 110          # horizontal padding
-PAD_TOP = 120        # top padding before opening quote
-PAD_BOTTOM = 100     # bottom padding after author line
-LINE_SPACING_FACTOR = 1.40
+# ─────────────────────────── font cache (LRU) ────────────────
+# ImageFont.truetype() читает файл с диска при каждом вызове.
+# lru_cache с maxsize=16 покрывает все используемые размеры (48..92+24)
+# и хранит объекты шрифта в памяти (~50 КБ каждый).
 
-BG_COLOR = (10, 10, 10)            # #0a0a0a
-TEXT_COLOR = (248, 245, 240)        # #f8f5f0  warm white
-AUTHOR_COLOR = (240, 233, 223)      # #f0e9df  slightly warmer
-QUOTE_MARK_ALPHA = 60              # semi-transparent opening «
-
-
+@lru_cache(maxsize=16)
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
+    """Загрузка шрифта с кэшированием в памяти."""
+    log.debug("Loading font size=%d (cache miss)", size)
     return ImageFont.truetype(str(FONT_PATH), size)
 
 
+# ─── «Заглушка» для textbbox — один раз создаётся dummy image+draw ───
+_DUMMY_IMG = Image.new("RGB", (1, 1))
+_DUMMY_DRAW = ImageDraw.Draw(_DUMMY_IMG)
+
+
+# ─────────────────────────── bg cache management ──────────────
+
+def _ensure_bg_cache_dir() -> None:
+    BG_CACHE_DIR.mkdir(exist_ok=True)
+    if not BG_CACHE_META.exists():
+        BG_CACHE_META.write_text("{}")
+
+
+def _load_bg_meta() -> dict:
+    try:
+        return json.loads(BG_CACHE_META.read_text())
+    except Exception:
+        return {}
+
+
+def _save_bg_meta(meta: dict) -> None:
+    BG_CACHE_META.write_text(json.dumps(meta, indent=2))
+
+
+def _avatar_file_hash(path: str) -> str:
+    """SHA-256 первых 64 КБ файла аватарки (достаточно для обнаружения изменений)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(65536))
+    return h.hexdigest()
+
+
+def _get_cached_bg(user_id: int, avatar_hash: str) -> str | None:
+    """
+    Возвращает путь к кэшированному фону, если он есть и хеш совпадает.
+    Кэшированный файл — JPEG с полным затемнением, размер IMG_WIDTH × IMG_MAX_HEIGHT.
+    При генерации конечного изображения он будет crop'нут до нужной высоты.
+    """
+    meta = _load_bg_meta()
+    entry = meta.get(str(user_id))
+    if not entry:
+        return None
+    if entry.get("hash") != avatar_hash:
+        # Аватар изменился — удаляем старый кэш
+        old_path = BG_CACHE_DIR / entry.get("file", "")
+        if old_path.exists():
+            old_path.unlink()
+            log.info("Removed stale bg cache: %s", old_path)
+        del meta[str(user_id)]
+        _save_bg_meta(meta)
+        return None
+    cached_path = BG_CACHE_DIR / entry["file"]
+    if cached_path.exists():
+        return str(cached_path)
+    return None
+
+
+def _save_bg_to_cache(user_id: int, avatar_hash: str, bg_img: Image.Image) -> str:
+    """
+    Сохраняет подготовленный фон (RGBA, IMG_WIDTH × IMG_MAX_HEIGHT) в кэш.
+    Возвращает путь к файлу.
+    """
+    filename = f"bg_{user_id}.png"
+    path = BG_CACHE_DIR / filename
+    bg_img.save(str(path), "PNG", optimize=True)
+
+    meta = _load_bg_meta()
+    meta[str(user_id)] = {
+        "hash": avatar_hash,
+        "file": filename,
+        "updated": time.time(),
+    }
+    _save_bg_meta(meta)
+    log.info("Cached bg for user %d → %s", user_id, path)
+    return str(path)
+
+
+# ─────────────────────────── avatar download ──────────────────
+
+async def _download_avatar(bot: Bot, user_id: int) -> str | None:
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if not photos.photos:
+            return None
+        photo_size = photos.photos[0][-1]
+        file = await bot.get_file(photo_size.file_id)
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        tmp.close()
+        await bot.download_file(file.file_path, tmp.name)
+        log.info("Avatar downloaded for user %d → %s", user_id, tmp.name)
+        return tmp.name
+    except Exception as exc:
+        log.warning("Could not download avatar for user %d: %s", user_id, exc)
+        return None
+
+
+def _get_author_user_id(msg: Message) -> int | None:
+    fwd = msg.forward_origin
+    if fwd:
+        user = getattr(fwd, "sender_user", None)
+        if user:
+            return user.id
+        return None
+    if msg.from_user:
+        return msg.from_user.id
+    return None
+
+
+# ─────────────────────────── image generation ─────────────────
+
 def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    """Word-wrap text so every line fits within max_width pixels."""
     words = text.split()
     lines: list[str] = []
     current = ""
-    dummy = Image.new("RGB", (1, 1))
-    draw = ImageDraw.Draw(dummy)
-
     for word in words:
         candidate = (current + " " + word).strip()
-        bbox = draw.textbbox((0, 0), candidate, font=font)
+        bbox = _DUMMY_DRAW.textbbox((0, 0), candidate, font=font)
         if bbox[2] <= max_width:
             current = candidate
         else:
@@ -94,174 +292,276 @@ def _draw_text_with_shadow(
     fill: tuple[int, int, int],
     anchor: str = "lt",
 ) -> None:
-    """Draw text with a soft multi-layer shadow for premium look."""
     x, y = xy
-    # shadow layers: (offset_px, alpha)
     shadows = [(4, 30), (2, 50), (1, 70)]
     for offset, alpha in shadows:
-        shadow_color = (*BG_COLOR[:3], alpha)  # RGBA
+        shadow_color = (*BG_COLOR[:3], alpha)
         draw.text((x + offset, y + offset), text, font=font, fill=shadow_color, anchor=anchor)
     draw.text((x, y), text, font=font, fill=fill, anchor=anchor)
 
 
-def generate_quote_image(quote: str, author: str) -> str:
+def _prepare_bg_from_photo(
+    photo_path: str,
+    canvas_w: int,
+    canvas_h: int,
+) -> Image.Image:
     """
-    Build a premium quote card and save it to a temp file.
-    Returns the temp file path (caller must unlink it).
-
-    Layout (top → bottom):
-      PAD_TOP
-      Opening decorative «  (large, semi-transparent)
-      Quote text lines      (Caveat Bold, dynamic size, centered)
-      Gap
-      Author line           (right-aligned, smaller)
-      PAD_BOTTOM
+    Загружает фото, cover-crop, затемняет.
+    Используем thumbnail() или reducing_gap для ускорения resize.
     """
-    # ── 1. find font size that fits ──────────────────────────────────
-    font_size = 92
-    min_font_size = 48
-    text_max_w = IMG_WIDTH - 2 * PAD_X
-    lines: list[str] = []
+    with PerfTimer("prepare_bg"):
+        photo = Image.open(photo_path).convert("RGB")  # RGB, не RGBA — экономим 25% RAM
 
-    while font_size >= min_font_size:
-        font = _load_font(font_size)
-        lines = _wrap_text(quote, font, text_max_w)
-        # measure tallest line
-        dummy = Image.new("RGB", (1, 1))
-        ddraw = ImageDraw.Draw(dummy)
-        sample_bbox = ddraw.textbbox((0, 0), "Ag", font=font)
-        line_h = int((sample_bbox[3] - sample_bbox[1]) * LINE_SPACING_FACTOR)
-        total_text_h = line_h * len(lines)
-        if total_text_h <= IMG_MAX_HEIGHT - PAD_TOP - PAD_BOTTOM - 140:
-            break
-        font_size -= 4
+        canvas_ratio = canvas_w / canvas_h
+        photo_ratio = photo.width / photo.height
 
-    font = _load_font(font_size)
-    author_font = _load_font(max(48, min(60, font_size - 28)))
+        if photo_ratio < canvas_ratio:
+            new_w = canvas_w
+            new_h = int(canvas_w / photo_ratio)
+        else:
+            new_h = canvas_h
+            new_w = int(canvas_h * photo_ratio)
 
-    dummy = Image.new("RGB", (1, 1))
-    ddraw = ImageDraw.Draw(dummy)
-    sample_bbox = ddraw.textbbox((0, 0), "Ag", font=font)
-    line_h = int((sample_bbox[3] - sample_bbox[1]) * LINE_SPACING_FACTOR)
+        # reducing_gap=2.0 — двухэтапный resize, быстрее на больших изображениях
+        photo = photo.resize((new_w, new_h), Image.LANCZOS, reducing_gap=2.0)
 
-    # decorative opening quote glyph height
-    quote_mark_font = _load_font(font_size + 24)
-    qm_bbox = ddraw.textbbox((0, 0), "«", font=quote_mark_font)
-    qm_h = qm_bbox[3] - qm_bbox[1]
+        left = (new_w - canvas_w) // 2
+        top = (new_h - canvas_h) // 2
+        photo = photo.crop((left, top, left + canvas_w, top + canvas_h))
 
-    # author line height
-    auth_bbox = ddraw.textbbox((0, 0), f"— {author}", font=author_font)
-    auth_h = auth_bbox[3] - auth_bbox[1]
+        enhancer = ImageEnhance.Brightness(photo)
+        darkened = enhancer.enhance(DARKEN_FACTOR)
 
-    # ── 2. compute canvas height ─────────────────────────────────────
-    gap_after_quote = int(line_h * 0.6)   # gap between text and author
-    gap_after_qm = int(qm_h * 0.3)        # gap between « and first line
+        result = darkened.convert("RGBA")
+        # Явно закрываем промежуточные объекты
+        photo.close()
+        darkened.close()
 
-    content_h = qm_h + gap_after_qm + line_h * len(lines) + gap_after_quote + auth_h
-    img_h = max(IMG_MIN_HEIGHT, min(IMG_MAX_HEIGHT, content_h + PAD_TOP + PAD_BOTTOM))
+        return result
 
-    # vertical centering offset so the block is centered in canvas
-    total_block_h = content_h
-    start_y = (img_h - total_block_h) // 2
 
-    # ── 3. create RGBA canvas (for shadow blending) ──────────────────
-    img = Image.new("RGBA", (IMG_WIDTH, img_h), (*BG_COLOR, 255))
+def _prepare_bg_from_photo_cached(
+    photo_path: str,
+    user_id: int | None,
+    canvas_w: int,
+    canvas_h: int,
+) -> Image.Image:
+    """
+    Обёртка с кэшированием.
+    Кэш хранит фон максимального размера (IMG_WIDTH × IMG_MAX_HEIGHT).
+    Для конкретной высоты холста — crop из кэша (быстрый).
+    """
+    if user_id is not None and photo_path:
+        avatar_hash = _avatar_file_hash(photo_path)
+        cached_path = _get_cached_bg(user_id, avatar_hash)
+
+        if cached_path:
+            log.info("Using cached bg for user %d", user_id)
+            with PerfTimer("load_cached_bg"):
+                img = Image.open(cached_path).convert("RGBA")
+                # Crop до нужной высоты (кэш хранит IMG_MAX_HEIGHT)
+                if img.height != canvas_h:
+                    top = (img.height - canvas_h) // 2
+                    img = img.crop((0, max(0, top), canvas_w, max(0, top) + canvas_h))
+                return img
+
+        # Генерируем и кэшируем на максимальный размер
+        with PerfTimer("generate_and_cache_bg"):
+            full_bg = _prepare_bg_from_photo(photo_path, IMG_WIDTH, IMG_MAX_HEIGHT)
+            _save_bg_to_cache(user_id, avatar_hash, full_bg)
+
+            # Crop до нужной высоты
+            if full_bg.height != canvas_h:
+                top = (full_bg.height - canvas_h) // 2
+                result = full_bg.crop((0, max(0, top), canvas_w, max(0, top) + canvas_h))
+                full_bg.close()
+                return result
+            return full_bg
+
+    # Нет user_id или фото — просто генерируем без кэша
+    return _prepare_bg_from_photo(photo_path, canvas_w, canvas_h)
+
+
+# ── Предгенерированный «базовый» тёмный фон (для случаев без аватарки) ──
+_BASE_BG_CACHE: dict[int, Image.Image] = {}
+
+
+def _get_dark_bg(canvas_h: int) -> Image.Image:
+    """
+    Тёмный фон с градиентом. Кэшируем по высоте.
+    Очищаем кэш, если он разрастается (маловероятно, высота ∈ [720..1600]).
+    """
+    if canvas_h in _BASE_BG_CACHE:
+        return _BASE_BG_CACHE[canvas_h].copy()
+
+    img = Image.new("RGBA", (IMG_WIDTH, canvas_h), (*BG_COLOR, 255))
     draw = ImageDraw.Draw(img)
-
-    # ── 4. subtle vertical gradient overlay (adds depth) ─────────────
-    # draw a very faint gradient from top to bottom
-    for row in range(img_h):
-        alpha = int(18 * (1 - row / img_h))  # fade from top
+    for row in range(canvas_h):
+        alpha = int(18 * (1 - row / canvas_h))
         draw.line([(0, row), (IMG_WIDTH, row)], fill=(255, 255, 255, alpha))
 
-    # ── 5. decorative opening «  ──────────────────────────────────────
-    qm_x = PAD_X - 10
-    qm_y = start_y
-    # draw semi-transparent « by rendering on temp layer
-    qm_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    qm_draw = ImageDraw.Draw(qm_layer)
-    qm_draw.text(
-        (qm_x, qm_y), "«", font=quote_mark_font,
-        fill=(*TEXT_COLOR, QUOTE_MARK_ALPHA), anchor="lt"
-    )
-    img = Image.alpha_composite(img, qm_layer)
-    draw = ImageDraw.Draw(img)
+    # Ограничиваем кэш до ~10 вариантов высоты
+    if len(_BASE_BG_CACHE) > 10:
+        _BASE_BG_CACHE.clear()
 
-    # ── 6. main quote lines (centered, with shadow) ───────────────────
-    text_y = start_y + qm_h + gap_after_qm
-    for line in lines:
-        lb = draw.textbbox((0, 0), line, font=font)
-        line_w = lb[2] - lb[0]
-        x = (IMG_WIDTH - line_w) // 2
-        _draw_text_with_shadow(draw, (x, text_y), line, font, TEXT_COLOR)
-        text_y += line_h
-
-    # ── 7. closing » (right side, same alpha) ────────────────────────
-    closing_y = text_y - line_h  # align with last text line
-    cl_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    cl_draw = ImageDraw.Draw(cl_layer)
-    cl_draw.text(
-        (IMG_WIDTH - PAD_X + 10, closing_y + line_h - qm_h // 2),
-        "»", font=quote_mark_font,
-        fill=(*TEXT_COLOR, QUOTE_MARK_ALPHA), anchor="lt"
-    )
-    img = Image.alpha_composite(img, cl_layer)
-    draw = ImageDraw.Draw(img)
-
-    # ── 8. thin accent line before author ────────────────────────────
-    line_y = text_y + gap_after_quote // 2
-    accent_x1 = IMG_WIDTH - PAD_X - 200
-    accent_x2 = IMG_WIDTH - PAD_X
-    draw.line([(accent_x1, line_y), (accent_x2, line_y)], fill=(180, 160, 140, 120), width=1)
-
-    # ── 9. author line (right-aligned) ───────────────────────────────
-    author_text = f"— {author}"
-    auth_y = text_y + gap_after_quote
-    _draw_text_with_shadow(
-        draw,
-        (IMG_WIDTH - PAD_X, auth_y),
-        author_text,
-        author_font,
-        AUTHOR_COLOR,
-        anchor="rt",   # right-top anchor
-    )
-
-    # ── 10. save as JPEG temp file ────────────────────────────────────
-    background = Image.new("RGB", img.size, BG_COLOR)
-    background.paste(img, mask=img.split()[3])
-    rgb_img = background
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    rgb_img.save(tmp.name, "JPEG", quality=96, optimize=True)
-    tmp.close()
-    return tmp.name
+    _BASE_BG_CACHE[canvas_h] = img
+    return img.copy()
 
 
-# ─────────────────────────── router / handlers ────────────────────────────
+def generate_quote_image(
+    quote: str,
+    author: str,
+    bg_image_path: str | None = None,
+    author_user_id: int | None = None,
+) -> str:
+    """
+    Build a premium quote card and save to a temp file.
+    Returns temp file path.
+    """
+    with PerfTimer("generate_quote_image_total"):
+
+        # ── 1. find font size that fits ──────────────────────────────
+        font_size = 92
+        min_font_size = 48
+        text_max_w = IMG_WIDTH - 2 * PAD_X
+        lines: list[str] = []
+
+        while font_size >= min_font_size:
+            font = _load_font(font_size)
+            lines = _wrap_text(quote, font, text_max_w)
+            sample_bbox = _DUMMY_DRAW.textbbox((0, 0), "Ag", font=font)
+            line_h = int((sample_bbox[3] - sample_bbox[1]) * LINE_SPACING_FACTOR)
+            total_text_h = line_h * len(lines)
+            if total_text_h <= IMG_MAX_HEIGHT - PAD_TOP - PAD_BOTTOM - 140:
+                break
+            font_size -= 4
+
+        font = _load_font(font_size)
+        author_font = _load_font(max(48, min(60, font_size - 28)))
+
+        sample_bbox = _DUMMY_DRAW.textbbox((0, 0), "Ag", font=font)
+        line_h = int((sample_bbox[3] - sample_bbox[1]) * LINE_SPACING_FACTOR)
+
+        quote_mark_font = _load_font(font_size + 24)
+        qm_bbox = _DUMMY_DRAW.textbbox((0, 0), "«", font=quote_mark_font)
+        qm_h = qm_bbox[3] - qm_bbox[1]
+
+        auth_bbox = _DUMMY_DRAW.textbbox((0, 0), f"— {author}", font=author_font)
+        auth_h = auth_bbox[3] - auth_bbox[1]
+
+        # ── 2. compute canvas height ─────────────────────────────────
+        gap_after_quote = int(line_h * 0.6)
+        gap_after_qm = int(qm_h * 0.3)
+
+        content_h = qm_h + gap_after_qm + line_h * len(lines) + gap_after_quote + auth_h
+        img_h = max(IMG_MIN_HEIGHT, min(IMG_MAX_HEIGHT, content_h + PAD_TOP + PAD_BOTTOM))
+
+        total_block_h = content_h
+        start_y = (img_h - total_block_h) // 2
+
+        # ── 3. create canvas ─────────────────────────────────────────
+        with PerfTimer("canvas_creation"):
+            if bg_image_path:
+                img = _prepare_bg_from_photo_cached(
+                    bg_image_path, author_user_id, IMG_WIDTH, img_h
+                )
+            else:
+                img = _get_dark_bg(img_h)
+
+        draw = ImageDraw.Draw(img)
+
+        # ── 5. decorative opening « ──────────────────────────────────
+        qm_x = PAD_X - 10
+        qm_y = start_y
+        qm_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        qm_draw = ImageDraw.Draw(qm_layer)
+        qm_draw.text(
+            (qm_x, qm_y), "«", font=quote_mark_font,
+            fill=(*TEXT_COLOR, QUOTE_MARK_ALPHA), anchor="lt"
+        )
+        img = Image.alpha_composite(img, qm_layer)
+        qm_layer.close()  # Освобождаем память
+        draw = ImageDraw.Draw(img)
+
+        # ── 6. main quote lines ──────────────────────────────────────
+        text_y = start_y + qm_h + gap_after_qm
+        for line in lines:
+            lb = draw.textbbox((0, 0), line, font=font)
+            line_w = lb[2] - lb[0]
+            x = (IMG_WIDTH - line_w) // 2
+            _draw_text_with_shadow(draw, (x, text_y), line, font, TEXT_COLOR)
+            text_y += line_h
+
+        # ── 7. closing » ─────────────────────────────────────────────
+        closing_y = text_y - line_h
+        cl_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        cl_draw = ImageDraw.Draw(cl_layer)
+        cl_draw.text(
+            (IMG_WIDTH - PAD_X + 10, closing_y + line_h - qm_h // 2),
+            "»", font=quote_mark_font,
+            fill=(*TEXT_COLOR, QUOTE_MARK_ALPHA), anchor="lt"
+        )
+        img = Image.alpha_composite(img, cl_layer)
+        cl_layer.close()  # Освобождаем память
+        draw = ImageDraw.Draw(img)
+
+        # ── 8. accent line ───────────────────────────────────────────
+        line_y = text_y + gap_after_quote // 2
+        accent_x1 = IMG_WIDTH - PAD_X - 200
+        accent_x2 = IMG_WIDTH - PAD_X
+        draw.line([(accent_x1, line_y), (accent_x2, line_y)],
+                  fill=(180, 160, 140, 120), width=1)
+
+        # ── 9. author line ───────────────────────────────────────────
+        author_text = f"— {author}"
+        auth_y = text_y + gap_after_quote
+        _draw_text_with_shadow(
+            draw,
+            (IMG_WIDTH - PAD_X, auth_y),
+            author_text,
+            author_font,
+            AUTHOR_COLOR,
+            anchor="rt",
+        )
+
+        # ── 10. save as JPEG ─────────────────────────────────────────
+        with PerfTimer("jpeg_save"):
+            background = Image.new("RGB", img.size, BG_COLOR)
+            background.paste(img, mask=img.split()[3])
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+            # quality=88 вместо 96: визуально почти неотличимо,
+            # но файл в ~1.5-2x меньше → быстрее upload в Telegram
+            background.save(tmp.name, "JPEG", quality=88, optimize=True)
+            tmp.close()
+
+        # Явно освобождаем память от тяжёлых объектов
+        img.close()
+        background.close()
+        gc.collect()
+
+        return tmp.name
+
+
+# ─────────────────────────── router / handlers ────────────────
 router = Router()
 
 
 def _get_author(msg: Message) -> str:
-    """Extract best available author name from forwarded message."""
-    # forwarded from user
     fwd = msg.forward_origin
     if fwd:
-        # MessageOriginUser
         user = getattr(fwd, "sender_user", None)
         if user:
             parts = [user.first_name or "", user.last_name or ""]
             name = " ".join(p for p in parts if p).strip()
             return name or (f"@{user.username}" if user.username else "Аноним")
-        # MessageOriginHiddenUser
         sender_name = getattr(fwd, "sender_user_name", None)
         if sender_name:
             return sender_name
-        # MessageOriginChannel / Chat
         chat = getattr(fwd, "chat", None)
         if chat:
             return chat.title or "Аноним"
 
-    # fallback: author of the original message (non-forwarded reply)
     sender = msg.from_user
     if sender:
         parts = [sender.first_name or "", sender.last_name or ""]
@@ -271,50 +571,84 @@ def _get_author(msg: Message) -> str:
 
 
 @router.message(
-    Command("quote"),
+    Command("цитата"),
     F.chat.type.in_({"supergroup", "group"}),
     F.message_thread_id == None
 )
 async def cmd_quote(message: Message) -> None:
     reply = message.reply_to_message
 
-    # ── guard: must reply to something ───────────────────────────────
     if not reply:
-        await message.reply(
-            "↩️ Ответьте командой /quote на сообщение с цитатой."
-        )
+        await message.reply("↩️ Ответьте командой /цитата на сообщение с цитатой.")
         return
 
-    # ── get text ─────────────────────────────────────────────────────
     quote_text: str | None = reply.text or reply.caption
     if not quote_text or not quote_text.strip():
-        await message.reply(
-            "😕 В сообщении нет текста для цитаты."
-        )
+        await message.reply("😕 В сообщении нет текста для цитаты.")
         return
 
     quote_text = quote_text.strip()
 
-    # ── get author ────────────────────────────────────────────────────
-    author = _get_author(reply)
-
-    log.info("Generating quote for author=%r, len=%d", author, len(quote_text))
-
-    # ── generate image in thread pool (Pillow is sync) ───────────────
-    try:
-        img_path = await asyncio.to_thread(generate_quote_image, quote_text, author)
-    except Exception as exc:
-        log.error("Image generation failed: %s", exc, exc_info=True)
-        await message.reply("❌ Не удалось создать картинку. Попробуйте позже.")
+    # ── Лимит символов ────────────────────────────────────────
+    if len(quote_text) > MAX_QUOTE_LENGTH:
+        await message.reply(
+            f"📏 Цитата слишком длинная ({len(quote_text)} симв.). "
+            f"Максимум — {MAX_QUOTE_LENGTH}."
+        )
         return
 
-    # ── send photo ────────────────────────────────────────────────────
+    author = _get_author(reply)
+
+    # ── скачиваем аватарку ────────────────────────────────────
+    avatar_path: str | None = None
+    author_user_id = _get_author_user_id(reply)
+    if author_user_id is not None:
+        avatar_path = await _download_avatar(message.bot, author_user_id)
+
+    log.info(
+        "Generating quote for chat_id=%d author=%r, len=%d, avatar=%s",
+        message.chat.id, author, len(quote_text), "yes" if avatar_path else "no",
+    )
+
+    # ── Семафор: ограничиваем одновременные генерации ─────────
+    # Если семафор занят — корутина ждёт, event loop не блокируется.
+    async with IMAGE_GEN_SEMAPHORE:
+        log.info(
+            "Semaphore acquired (active=%d/%d), RSS=%.1fMB",
+            IMAGE_GEN_SEMAPHORE._value,
+            2,  # initial value
+            _get_rss_mb(),
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            img_path = await loop.run_in_executor(
+                IMAGE_EXECUTOR,
+                generate_quote_image,
+                quote_text,
+                author,
+                avatar_path,
+                author_user_id,
+            )
+        except Exception as exc:
+            log.error("Image generation failed: %s", exc, exc_info=True)
+            await message.reply("❌ Не удалось создать картинку. Попробуйте позже.")
+            return
+        finally:
+            if avatar_path:
+                try:
+                    os.unlink(avatar_path)
+                except OSError:
+                    pass
+
+    # ── send photo ────────────────────────────────────────────
+    thread_id = SUPERCHAT_TO_THREAD_MAP.get(message.chat.id, QUOTE_THREAD_ID)
+    
     try:
         photo = FSInputFile(img_path)
         await message.bot.send_photo(
             chat_id=message.chat.id,
             photo=photo,
-            message_thread_id=2
+            message_thread_id=thread_id,
         )
     except Exception as exc:
         log.error("Failed to send photo: %s", exc, exc_info=True)
@@ -322,35 +656,43 @@ async def cmd_quote(message: Message) -> None:
     finally:
         try:
             os.unlink(img_path)
-            log.info("Temp file removed: %s", img_path)
         except OSError:
             pass
 
 
-# thread_id guard fallback — silent ignore outside the target topic
-@router.message(Command("quote"))
+@router.message(Command("цитата"))
 async def cmd_quote_wrong_thread(message: Message) -> None:
     log.debug(
-        "Ignored /quote from chat=%s thread=%s",
+        "Ignored /цитата from chat=%s thread=%s",
         message.chat.id,
         message.message_thread_id,
     )
 
 
-# ─────────────────────────── lifecycle ───────────────────────────────────
+# ─────────────────────────── lifecycle ────────────────────────
+
 async def on_startup(bot: Bot) -> None:
     me = await bot.get_me()
     log.info("Bot started: @%s (id=%d)", me.username, me.id)
+    log.info("Initial RSS: %.1f MB", _get_rss_mb())
 
 
 async def on_shutdown(bot: Bot) -> None:
-    log.info("Bot shutting down …")
+    log.info("Bot shutting down, RSS: %.1f MB", _get_rss_mb())
+    IMAGE_EXECUTOR.shutdown(wait=False)
     await bot.session.close()
 
 
-# ─────────────────────────── entry point ─────────────────────────────────
+# ─────────────────────────── entry point ──────────────────────
+
 async def main() -> None:
     ensure_font()
+    _ensure_bg_cache_dir()
+
+    # Предварительно загрузим самые частые размеры шрифтов в кэш
+    for size in (48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 116):
+        _load_font(size)
+    log.info("Font cache warmed up (%d entries)", _load_font.cache_info().currsize)
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
