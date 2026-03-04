@@ -13,10 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
+import emoji as emoji_lib
 from dotenv import load_dotenv
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
-from pilmoji import Pilmoji
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
@@ -42,6 +42,10 @@ FONT_URL = "https://github.com/googlefonts/caveat/raw/main/fonts/ttf/Caveat-Bold
 BG_CACHE_DIR = Path("./bg_cache")
 BG_CACHE_META = BG_CACHE_DIR / "_meta.json"
 
+# Директория кэша PNG-эмодзи (Twemoji)
+EMOJI_CACHE_DIR = Path("./emoji_cache")
+TWEMOJI_CDN = "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -64,23 +68,16 @@ AUTHOR_COLOR = (240, 233, 223)
 
 DARKEN_FACTOR = 0.6
 
-# ── Лимит символов цитаты — увеличен до 800 ──
 MAX_QUOTE_LENGTH = 800
-
-# ── Минимальный шрифт уменьшен до 28 для вмещения длинных цитат ──
 MIN_FONT_SIZE = 28
 
-# ── Семафор: максимум 4 одновременных генерации изображений ──
 IMAGE_GEN_SEMAPHORE = asyncio.Semaphore(4)
-
-# ── ThreadPoolExecutor с 2 воркерами ──
 IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="img_gen")
 
 
 # ─────────────────────────── profiling helpers ────────────────
 
 def _get_memory_mb() -> float:
-    """Текущий RSS процесса в МБ (Linux/macOS)."""
     try:
         usage = resource.getrusage(resource.RUSAGE_SELF)
         rss_kb = usage.ru_maxrss
@@ -92,7 +89,6 @@ def _get_memory_mb() -> float:
 
 
 def _get_rss_mb() -> float:
-    """Текущий RSS через /proc/self/status (точнее для Linux)."""
     try:
         with open("/proc/self/status") as f:
             for line in f:
@@ -104,8 +100,6 @@ def _get_rss_mb() -> float:
 
 
 class PerfTimer:
-    """Контекстный менеджер для профилирования блоков кода."""
-
     def __init__(self, label: str):
         self.label = label
         self.start_time = 0.0
@@ -146,14 +140,108 @@ def ensure_font() -> None:
 
 @lru_cache(maxsize=32)
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    """Загрузка шрифта с кэшированием в памяти."""
     log.debug("Loading font size=%d (cache miss)", size)
     return ImageFont.truetype(str(FONT_PATH), size)
 
 
-# ─── «Заглушка» для textbbox — один раз создаётся dummy image+draw ───
 _DUMMY_IMG = Image.new("RGB", (1, 1))
 _DUMMY_DRAW = ImageDraw.Draw(_DUMMY_IMG)
+
+
+# ─────────────────────────── emoji rendering ──────────────────
+
+def _ensure_emoji_cache() -> None:
+    EMOJI_CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _emoji_to_twemoji_name(em_str: str) -> str:
+    """
+    Конвертирует строку эмодзи в имя файла Twemoji.
+    Правило: соединяем кодпоинты через «-», исключая U+FE0F (variation selector-16).
+    """
+    cps = [f"{ord(c):x}" for c in em_str if ord(c) != 0xFE0F]
+    return "-".join(cps)
+
+
+# Кэш в памяти: {(emoji_str, size): Image | None}
+_emoji_img_cache: dict[tuple[str, int], Image.Image | None] = {}
+
+
+def _get_emoji_image(em_str: str, size: int) -> Image.Image | None:
+    """
+    Возвращает RGBA-изображение эмодзи размером size×size.
+    Скачивает PNG из Twemoji CDN и кэширует на диск + в памяти.
+    """
+    cache_key = (em_str, size)
+    if cache_key in _emoji_img_cache:
+        cached = _emoji_img_cache[cache_key]
+        return cached.copy() if cached is not None else None
+
+    base_name = _emoji_to_twemoji_name(em_str)
+    disk_path = EMOJI_CACHE_DIR / f"{base_name}.png"
+
+    # Попытка скачать (без FE0F)
+    if not disk_path.exists():
+        url = TWEMOJI_CDN + f"{base_name}.png"
+        try:
+            urllib.request.urlretrieve(url, disk_path)
+        except Exception as e1:
+            # Fallback: попробуем с FE0F
+            alt_name = "-".join(f"{ord(c):x}" for c in em_str)
+            alt_path = EMOJI_CACHE_DIR / f"{alt_name}.png"
+            if not alt_path.exists():
+                try:
+                    urllib.request.urlretrieve(TWEMOJI_CDN + f"{alt_name}.png", alt_path)
+                    disk_path = alt_path
+                except Exception as e2:
+                    log.warning("Emoji download failed %r (tried %s and %s): %s / %s",
+                                em_str, base_name, alt_name, e1, e2)
+                    _emoji_img_cache[cache_key] = None
+                    return None
+            else:
+                disk_path = alt_path
+
+    try:
+        full = Image.open(disk_path).convert("RGBA")
+        resized = full.resize((size, size), Image.LANCZOS)
+        full.close()
+        _emoji_img_cache[cache_key] = resized
+        return resized.copy()
+    except Exception as e:
+        log.warning("Cannot open emoji image %s: %s", disk_path, e)
+        _emoji_img_cache[cache_key] = None
+        return None
+
+
+def _segment_text(text: str) -> list[tuple[str, bool]]:
+    """
+    Разбивает текст на сегменты [(строка, is_emoji), ...].
+    is_emoji=True — этот сегмент нужно рендерить как эмодзи-изображение.
+    """
+    result: list[tuple[str, bool]] = []
+    last = 0
+    for em in emoji_lib.emoji_list(text):
+        start, end = em["match_start"], em["match_end"]
+        if last < start:
+            result.append((text[last:start], False))
+        result.append((em["emoji"], True))
+        last = end
+    if last < len(text):
+        result.append((text[last:], False))
+    return result
+
+
+def _measure_line_width(text: str, font: ImageFont.FreeTypeFont, emoji_size: int) -> int:
+    """Измеряет ширину строки с учётом эмодзи (каждый = emoji_size пикселей)."""
+    total = 0
+    for seg, is_emoji_seg in _segment_text(text):
+        if is_emoji_seg:
+            # emoji_list возвращает по одному объекту на каждую кластер-последовательность
+            total += len(emoji_lib.emoji_list(seg)) * emoji_size
+        elif seg:
+            bbox = _DUMMY_DRAW.textbbox((0, 0), seg, font=font)
+            total += bbox[2] - bbox[0]
+    return total
 
 
 # ─────────────────────────── bg cache management ──────────────
@@ -176,7 +264,6 @@ def _save_bg_meta(meta: dict) -> None:
 
 
 def _avatar_file_hash(path: str) -> str:
-    """SHA-256 первых 64 КБ файла аватарки."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         h.update(f.read(65536))
@@ -206,7 +293,6 @@ def _save_bg_to_cache(user_id: int, avatar_hash: str, bg_img: Image.Image) -> st
     filename = f"bg_{user_id}.png"
     path = BG_CACHE_DIR / filename
     bg_img.save(str(path), "PNG", optimize=True)
-
     meta = _load_bg_meta()
     meta[str(user_id)] = {
         "hash": avatar_hash,
@@ -260,91 +346,165 @@ def _estimate_font_size(
     s_min: int = MIN_FONT_SIZE,
 ) -> int:
     """
-    Оценивает оптимальный размер шрифта за 2 вызова textbbox
-    (вместо ~17 × N_words в цикле).
-
-    Возвращает размер, выровненный по step, который с высокой
-    вероятностью подойдёт. Требует одной верификации через _wrap_text.
+    Быстро оценивает оптимальный размер шрифта (2 вызова textbbox).
+    Для текста с эмодзи может переоценить — корректируется в цикле верификации.
     """
     s_ref = s_max
     font_ref = _load_font(s_ref)
 
-    # ── Два единственных вызова textbbox ──────────────────────
-    # 1) Полная ширина текста без переноса
     bbox = _DUMMY_DRAW.textbbox((0, 0), text, font=font_ref)
     w_total = bbox[2] - bbox[0]
 
-    # 2) Высота строки
     h_bbox = _DUMMY_DRAW.textbbox((0, 0), "Ag", font=font_ref)
     h_line = (h_bbox[3] - h_bbox[1]) * LINE_SPACING_FACTOR
 
     if w_total <= 0 or h_line <= 0:
         return s_max
 
-    # ── Если при s_max текст и так влезает в одну строку ──────
     if w_total <= max_width:
         return s_max
 
-    # ── Формула: S ≤ √(H_avail × S_ref² × max_width / (W_total × H_line))
     s_squared = (max_text_height * s_ref * s_ref * max_width) / (w_total * h_line)
-    s_est = math.isqrt(int(s_squared))  # округление вниз
-
-    # Выравниваем вниз по шагу (консервативно)
+    s_est = math.isqrt(int(s_squared))
     s_est = (s_est // step) * step
-
-    # Зажимаем в допустимый диапазон
     return max(s_min, min(s_max, s_est))
 
 
 def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> list[str]:
-    """Перенос текста по словам с учётом ширины в пикселях."""
+    """
+    Перенос текста по словам с учётом:
+    - ширины смешанного контента (текст + эмодзи)
+    - «слов» без пробелов (строки из одних эмодзи)
+    """
+    sample_bbox = _DUMMY_DRAW.textbbox((0, 0), "Ag", font=font)
+    # Приближённый размер эмодзи = высота строки * 0.9
+    emoji_size = max(16, int((sample_bbox[3] - sample_bbox[1]) * 0.9))
+
+    def measure(s: str) -> int:
+        return _measure_line_width(s, font, emoji_size)
+
+    def split_long_word(word: str) -> list[str]:
+        """Разбивает слишком длинное слово (или строку эмодзи) по символам/кластерам."""
+        # Получаем список «атомарных» единиц: каждый эмодзи-кластер — одна единица
+        atoms: list[str] = []
+        last_pos = 0
+        for em in emoji_lib.emoji_list(word):
+            for ch in word[last_pos:em["match_start"]]:
+                atoms.append(ch)
+            atoms.append(em["emoji"])
+            last_pos = em["match_end"]
+        for ch in word[last_pos:]:
+            atoms.append(ch)
+
+        sub_lines: list[str] = []
+        current = ""
+        for atom in atoms:
+            candidate = current + atom
+            if measure(candidate) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    sub_lines.append(current)
+                current = atom
+        if current:
+            sub_lines.append(current)
+        return sub_lines
+
     words = text.split()
     lines: list[str] = []
     current = ""
+
     for word in words:
-        candidate = (current + " " + word).strip()
-        bbox = _DUMMY_DRAW.textbbox((0, 0), candidate, font=font)
-        if bbox[2] <= max_width:
+        candidate = (current + " " + word).strip() if current else word
+        if measure(candidate) <= max_width:
             current = candidate
         else:
             if current:
                 lines.append(current)
-            current = word
+                current = ""
+
+            if measure(word) <= max_width:
+                current = word
+            else:
+                # Слово слишком длинное — дробим посимвольно
+                for sub in split_long_word(word):
+                    if not current:
+                        current = sub
+                    else:
+                        candidate2 = current + sub
+                        if measure(candidate2) <= max_width:
+                            current = candidate2
+                        else:
+                            lines.append(current)
+                            current = sub
+
     if current:
         lines.append(current)
     return lines
 
 
-def _draw_text_with_shadow(
-    pilmoji_drawer: Pilmoji,
-    xy: tuple[int, int],
+def _draw_line_with_shadow(
+    draw: ImageDraw.ImageDraw,
+    img: Image.Image,
+    x: int,
+    y: int,
     text: str,
     font: ImageFont.FreeTypeFont,
-    fill: tuple[int, int, int],
-    anchor: str = "lt",
-    emoji_scale_factor: float = 1.0,
+    emoji_size: int,
+    fill: tuple,
+    line_h: int,
 ) -> None:
     """
-    Рисуем текст с тенью через Pilmoji (поддержка эмодзи).
+    Рисует строку смешанного текста (текст + эмодзи) с тенью.
 
-    Pilmoji.text() не поддерживает параметр anchor напрямую,
-    поэтому для anchor="rt" (right-top) нужно вручную вычислять x.
-    Здесь мы используем anchor только для вычисления позиции,
-    а сам вызов pilmoji.text() всегда рисует с left-top.
+    • Обычный текст — через ImageDraw.text() с RGBA-тенями
+    • Эмодзи — Twemoji PNG, вертикально центрированные по метрикам шрифта
     """
-    x, y = xy
-    shadows = [(4, 30), (2, 50), (1, 70)]
-    for offset, alpha in shadows:
-        shadow_color = (*BG_COLOR[:3], alpha)
-        pilmoji_drawer.text(
-            (x + offset, y + offset), text, font=font,
-            fill=shadow_color,
-            emoji_scale_factor=emoji_scale_factor,
-        )
-    pilmoji_drawer.text(
-        (x, y), text, font=font, fill=fill,
-        emoji_scale_factor=emoji_scale_factor,
-    )
+    segments = _segment_text(text)
+
+    # Вертикальное смещение для центровки эмодзи
+    # textbbox при anchor lt: y0 — отступ сверху (обычно отрицательный у рукописных шрифтов)
+    sample = _DUMMY_DRAW.textbbox((0, 0), "Ag", font=font)
+    text_top_offset = sample[1]      # обычно <= 0 для кириллицы/латиницы
+    text_bot_offset = sample[3]
+    text_visual_center = (text_top_offset + text_bot_offset) / 2
+    emoji_y = int(y + text_visual_center - emoji_size / 2)
+
+    current_x = x
+
+    for seg, is_emoji_seg in segments:
+        if is_emoji_seg:
+            em_img = _get_emoji_image(seg, emoji_size)
+            if em_img is not None:
+                # Полупрозрачная тень под эмодзи
+                for sx, sy, sa in ((3, 3, 60), (1, 1, 40)):
+                    shadow = Image.new("RGBA", em_img.size, (*BG_COLOR, 0))
+                    # Тень = тёмное изображение с маской от альфа-канала эмодзи
+                    dark_layer = Image.new("RGBA", em_img.size, (*BG_COLOR, sa))
+                    shadow = Image.composite(dark_layer,
+                                            Image.new("RGBA", em_img.size, (0, 0, 0, 0)),
+                                            em_img.split()[3])
+                    img.paste(shadow, (current_x + sx, emoji_y + sy), shadow)
+                img.paste(em_img, (current_x, emoji_y), em_img)
+                em_img.close()
+                current_x += emoji_size
+            else:
+                # Fallback: рисуем «□» вместо неизвестного эмодзи
+                draw.text((current_x, y), "□", font=font, fill=fill)
+                fb_bbox = _DUMMY_DRAW.textbbox((0, 0), "□", font=font)
+                current_x += fb_bbox[2] - fb_bbox[0]
+        else:
+            if not seg:
+                continue
+            # Тень текста
+            for sx, sy, sa in ((4, 4, 30), (2, 2, 50), (1, 1, 70)):
+                draw.text(
+                    (current_x + sx, y + sy), seg, font=font,
+                    fill=(*BG_COLOR[:3], sa),
+                )
+            draw.text((current_x, y), seg, font=font, fill=fill)
+            seg_bbox = _DUMMY_DRAW.textbbox((0, 0), seg, font=font)
+            current_x += seg_bbox[2] - seg_bbox[0]
 
 
 def _prepare_bg_from_photo(
@@ -414,7 +574,6 @@ def _prepare_bg_from_photo_cached(
     return _prepare_bg_from_photo(photo_path, canvas_w, canvas_h)
 
 
-# ── Предгенерированный «базовый» тёмный фон ──
 _BASE_BG_CACHE: dict[int, Image.Image] = {}
 
 
@@ -442,8 +601,8 @@ def generate_quote_image(
     author_user_id: int | None = None,
 ) -> str:
     """
-    Build a premium quote card and save to a temp file.
-    Returns temp file path.
+    Строит карточку-цитату и сохраняет во временный файл.
+    Возвращает путь к файлу.
     """
     with PerfTimer("generate_quote_image_total"):
 
@@ -452,26 +611,33 @@ def generate_quote_image(
         text_max_w = IMG_WIDTH - 2 * PAD_X
         max_text_h = IMG_MAX_HEIGHT - PAD_TOP - PAD_BOTTOM - 140
 
-        # ── 2. Оценка оптимального размера шрифта (2 вызова textbbox) ─
+        # ── 2. Оценка размера шрифта ─────────────────────────────────
         font_size = _estimate_font_size(display_quote, text_max_w, max_text_h)
 
-        # ── 3. Верификация + корректировка (обычно 0–2 итерации) ──────
+        # ── 3. Верификация + корректировка ───────────────────────────
         font = _load_font(font_size)
-        lines = _wrap_text(display_quote, font, text_max_w)
+        # emoji_size для переноса = высота строки * 0.9
         sample_bbox = _DUMMY_DRAW.textbbox((0, 0), "Ag", font=font)
+        emoji_size = max(16, int((sample_bbox[3] - sample_bbox[1]) * 0.9))
         line_h = int((sample_bbox[3] - sample_bbox[1]) * LINE_SPACING_FACTOR)
+
+        lines = _wrap_text(display_quote, font, text_max_w)
 
         while line_h * len(lines) > max_text_h and font_size > MIN_FONT_SIZE:
             font_size -= 4
             font = _load_font(font_size)
-            lines = _wrap_text(display_quote, font, text_max_w)
             sample_bbox = _DUMMY_DRAW.textbbox((0, 0), "Ag", font=font)
+            emoji_size = max(16, int((sample_bbox[3] - sample_bbox[1]) * 0.9))
             line_h = int((sample_bbox[3] - sample_bbox[1]) * LINE_SPACING_FACTOR)
+            lines = _wrap_text(display_quote, font, text_max_w)
 
-        # ── 4. Шрифт автора и метрики ────────────────────────────────
-        emoji_scale = max(0.85, min(1.15, font_size / 80))
+        # ── 4. Шрифт и метрики автора ────────────────────────────────
         author_font_size = max(28, min(60, font_size - 24))
         author_font = _load_font(author_font_size)
+        author_emoji_size = max(16, int(
+            (_DUMMY_DRAW.textbbox((0, 0), "Ag", font=author_font)[3]
+             - _DUMMY_DRAW.textbbox((0, 0), "Ag", font=author_font)[1]) * 0.9
+        ))
 
         auth_bbox = _DUMMY_DRAW.textbbox((0, 0), f"— {author}", font=author_font)
         auth_h = auth_bbox[3] - auth_bbox[1]
@@ -480,7 +646,6 @@ def generate_quote_image(
         gap_after_quote = int(line_h * 0.6)
         content_h = line_h * len(lines) + gap_after_quote + auth_h
         img_h = max(IMG_MIN_HEIGHT, min(IMG_MAX_HEIGHT, content_h + PAD_TOP + PAD_BOTTOM))
-
         start_y = (img_h - content_h) // 2
 
         # ── 6. Создание холста ───────────────────────────────────────
@@ -492,23 +657,25 @@ def generate_quote_image(
             else:
                 img = _get_dark_bg(img_h)
 
-        # ── 7. Рендеринг текста через Pilmoji ───────────────────────
-        with Pilmoji(img) as pilmoji_drawer:
+        # ── 7. Рендеринг текста ──────────────────────────────────────
+        draw = ImageDraw.Draw(img)
 
-            # ── 7a. Строки цитаты (с ёлочками) ───────────────────────
+        with PerfTimer("text_rendering"):
+
+            # ── 7a. Строки цитаты ────────────────────────────────────
             text_y = start_y
             for line in lines:
-                lb = _DUMMY_DRAW.textbbox((0, 0), line, font=font)
-                line_w = lb[2] - lb[0]
+                # Для центровки используем измерение с учётом эмодзи
+                line_w = _measure_line_width(line, font, emoji_size)
                 x = (IMG_WIDTH - line_w) // 2
-                _draw_text_with_shadow(
-                    pilmoji_drawer, (x, text_y), line, font, TEXT_COLOR,
-                    emoji_scale_factor=emoji_scale,
+                _draw_line_with_shadow(
+                    draw, img, x, text_y,
+                    line, font, emoji_size,
+                    TEXT_COLOR, line_h,
                 )
                 text_y += line_h
 
             # ── 7b. Акцентная линия ──────────────────────────────────
-            draw = ImageDraw.Draw(img)
             line_y = text_y + gap_after_quote // 2
             accent_x1 = IMG_WIDTH - PAD_X - 200
             accent_x2 = IMG_WIDTH - PAD_X
@@ -517,21 +684,17 @@ def generate_quote_image(
                 fill=(180, 160, 140, 120), width=1,
             )
 
-            # ── 7c. Автор (правое выравнивание вручную) ──────────────
+            # ── 7c. Автор (правое выравнивание) ──────────────────────
             author_text = f"— {author}"
             auth_y = text_y + gap_after_quote
 
-            ab = _DUMMY_DRAW.textbbox((0, 0), author_text, font=author_font)
-            author_w = ab[2] - ab[0]
+            author_w = _measure_line_width(author_text, author_font, author_emoji_size)
             author_x = IMG_WIDTH - PAD_X - author_w
 
-            _draw_text_with_shadow(
-                pilmoji_drawer,
-                (author_x, auth_y),
-                author_text,
-                author_font,
-                AUTHOR_COLOR,
-                emoji_scale_factor=emoji_scale,
+            _draw_line_with_shadow(
+                draw, img, author_x, auth_y,
+                author_text, author_font, author_emoji_size,
+                AUTHOR_COLOR, line_h,
             )
 
         # ── 8. Сохранение JPEG ───────────────────────────────────────
@@ -596,7 +759,6 @@ async def cmd_quote(message: Message) -> None:
 
     quote_text = quote_text.strip()
 
-    # ── Лимит символов ────────────────────────────────────────
     if len(quote_text) > MAX_QUOTE_LENGTH:
         await message.reply(
             f"📏 Цитата слишком длинная ({len(quote_text)} симв.). "
@@ -606,7 +768,6 @@ async def cmd_quote(message: Message) -> None:
 
     author = _get_author(reply)
 
-    # ── скачиваем аватарку ────────────────────────────────────
     avatar_path: str | None = None
     author_user_id = _get_author_user_id(reply)
     if author_user_id is not None:
@@ -617,13 +778,10 @@ async def cmd_quote(message: Message) -> None:
         message.chat.id, author, len(quote_text), "yes" if avatar_path else "no",
     )
 
-    # ── Семафор: ограничиваем одновременные генерации ─────────
     async with IMAGE_GEN_SEMAPHORE:
         log.info(
             "Semaphore acquired (active=%d/%d), RSS=%.1fMB",
-            IMAGE_GEN_SEMAPHORE._value,
-            2,
-            _get_rss_mb(),
+            IMAGE_GEN_SEMAPHORE._value, 2, _get_rss_mb(),
         )
         try:
             loop = asyncio.get_running_loop()
@@ -646,7 +804,6 @@ async def cmd_quote(message: Message) -> None:
                 except OSError:
                     pass
 
-    # ── send photo ────────────────────────────────────────────
     thread_id = SUPERCHAT_TO_THREAD_MAP.get(message.chat.id, QUOTE_THREAD_ID)
 
     try:
@@ -694,11 +851,10 @@ async def on_shutdown(bot: Bot) -> None:
 async def main() -> None:
     ensure_font()
     _ensure_bg_cache_dir()
+    _ensure_emoji_cache()
 
-    # Предварительно загрузим шрифты в кэш (расширенный диапазон до 28)
     for size in range(28, 96, 4):
         _load_font(size)
-    # Плюс размеры для автора
     for size in (28, 32, 36, 40, 44, 48, 52, 56, 60):
         _load_font(size)
     log.info("Font cache warmed up (%d entries)", _load_font.cache_info().currsize)
