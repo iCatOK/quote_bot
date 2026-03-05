@@ -38,6 +38,14 @@ FONT_DIR = Path("./fonts")
 FONT_PATH = FONT_DIR / "Caveat-Bold.ttf"
 FONT_URL = "https://github.com/googlefonts/caveat/raw/main/fonts/ttf/Caveat-Bold.ttf"
 
+# Шрифт для водяного знака (нерукописный)
+WATERMARK_FONT_PATH = FONT_DIR / "Roboto-Regular.ttf"
+WATERMARK_FONT_URL = "https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf"
+WATERMARK_TEXT = "@chpi_quote_bot"
+WATERMARK_FONT_SIZE = 22
+WATERMARK_COLOR = (180, 180, 180, 180)
+WATERMARK_PADDING = 20
+
 # Директория кэша фонов аватаров
 BG_CACHE_DIR = Path("./bg_cache")
 BG_CACHE_META = BG_CACHE_DIR / "_meta.json"
@@ -71,8 +79,11 @@ DARKEN_FACTOR = 0.6
 MAX_QUOTE_LENGTH = 800
 MIN_FONT_SIZE = 28
 
-IMAGE_GEN_SEMAPHORE = asyncio.Semaphore(4)
-IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="img_gen")
+MAX_SEMAPHORE_COUNT = 4
+MAX_WORKERS = 4
+
+IMAGE_GEN_SEMAPHORE = asyncio.Semaphore(MAX_SEMAPHORE_COUNT)
+IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="img_gen")
 
 
 # ─────────────────────────── profiling helpers ────────────────
@@ -136,12 +147,28 @@ def ensure_font() -> None:
     log.info("Font saved to %s", FONT_PATH)
 
 
+def ensure_watermark_font() -> None:
+    FONT_DIR.mkdir(exist_ok=True)
+    if WATERMARK_FONT_PATH.exists():
+        log.info("Watermark font already present: %s", WATERMARK_FONT_PATH)
+        return
+    log.info("Downloading Roboto-Regular.ttf …")
+    urllib.request.urlretrieve(WATERMARK_FONT_URL, WATERMARK_FONT_PATH)
+    log.info("Watermark font saved to %s", WATERMARK_FONT_PATH)
+
+
 # ─────────────────────────── font cache (LRU) ────────────────
 
 @lru_cache(maxsize=32)
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
     log.debug("Loading font size=%d (cache miss)", size)
     return ImageFont.truetype(str(FONT_PATH), size)
+
+
+@lru_cache(maxsize=4)
+def _load_watermark_font(size: int) -> ImageFont.FreeTypeFont:
+    log.debug("Loading watermark font size=%d (cache miss)", size)
+    return ImageFont.truetype(str(WATERMARK_FONT_PATH), size)
 
 
 _DUMMY_IMG = Image.new("RGB", (1, 1))
@@ -304,6 +331,14 @@ def _save_bg_to_cache(user_id: int, avatar_hash: str, bg_img: Image.Image) -> st
     return str(path)
 
 
+def _bg_cache_exists_for_avatar(user_id: int | None, avatar_path: str | None) -> bool:
+    """Проверяет, есть ли актуальный кэш фона для данной аватарки."""
+    if user_id is None or not avatar_path:
+        return True  # Не нужно кэширование с аватаркой
+    avatar_hash = _avatar_file_hash(avatar_path)
+    return _get_cached_bg(user_id, avatar_hash) is not None
+
+
 # ─────────────────────────── avatar download ──────────────────
 
 async def _download_avatar(bot: Bot, user_id: int) -> str | None:
@@ -333,6 +368,21 @@ def _get_author_user_id(msg: Message) -> int | None:
     if msg.from_user:
         return msg.from_user.id
     return None
+
+
+# ─────────────────────────── watermark ────────────────────────
+
+def _draw_watermark(img: Image.Image, draw: ImageDraw.ImageDraw) -> None:
+    """Рисует водяной знак @chpi_quote_bot в левом нижнем углу."""
+    font = _load_watermark_font(WATERMARK_FONT_SIZE)
+    bbox = draw.textbbox((0, 0), WATERMARK_TEXT, font=font)
+    text_h = bbox[3] - bbox[1]
+    x = WATERMARK_PADDING
+    y = img.height - text_h - WATERMARK_PADDING
+    # Тень для читаемости
+    draw.text((x + 1, y + 1), WATERMARK_TEXT, font=font, fill=(0, 0, 0, 120))
+    # Основной текст
+    draw.text((x, y), WATERMARK_TEXT, font=font, fill=WATERMARK_COLOR)
 
 
 # ─────────────────────────── image generation ─────────────────
@@ -697,6 +747,9 @@ def generate_quote_image(
                 AUTHOR_COLOR, line_h,
             )
 
+            # ── 7d. Водяной знак ─────────────────────────────────────
+            _draw_watermark(img, draw)
+
         # ── 8. Сохранение JPEG ───────────────────────────────────────
         with PerfTimer("jpeg_save"):
             background = Image.new("RGB", img.size, BG_COLOR)
@@ -768,10 +821,17 @@ async def cmd_quote(message: Message) -> None:
 
     author = _get_author(reply)
 
+    # Отправляем статусное сообщение
+    status_msg = await message.answer("⏳ Создаю цитату...")
+
     avatar_path: str | None = None
     author_user_id = _get_author_user_id(reply)
     if author_user_id is not None:
         avatar_path = await _download_avatar(message.bot, author_user_id)
+
+    # Проверяем, нужно ли создавать кэш фона (долгая операция)
+    if avatar_path and not _bg_cache_exists_for_avatar(author_user_id, avatar_path):
+        await status_msg.edit_text("🖼 Создаю фон из аватарки (около 30-50 секунд)...")
 
     log.info(
         "Generating quote for chat_id=%d author=%r, len=%d, avatar=%s",
@@ -781,7 +841,7 @@ async def cmd_quote(message: Message) -> None:
     async with IMAGE_GEN_SEMAPHORE:
         log.info(
             "Semaphore acquired (active=%d/%d), RSS=%.1fMB",
-            IMAGE_GEN_SEMAPHORE._value, 2, _get_rss_mb(),
+            IMAGE_GEN_SEMAPHORE._value, MAX_SEMAPHORE_COUNT, _get_rss_mb(),
         )
         try:
             loop = asyncio.get_running_loop()
@@ -796,6 +856,10 @@ async def cmd_quote(message: Message) -> None:
         except Exception as exc:
             log.error("Image generation failed: %s", exc, exc_info=True)
             await message.reply("❌ Не удалось создать картинку. Попробуйте позже.")
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
             return
         finally:
             if avatar_path:
@@ -820,6 +884,10 @@ async def cmd_quote(message: Message) -> None:
         try:
             os.unlink(img_path)
         except OSError:
+            pass
+        try:
+            await status_msg.delete()
+        except Exception:
             pass
 
 
@@ -850,6 +918,7 @@ async def on_shutdown(bot: Bot) -> None:
 
 async def main() -> None:
     ensure_font()
+    ensure_watermark_font()
     _ensure_bg_cache_dir()
     _ensure_emoji_cache()
 
