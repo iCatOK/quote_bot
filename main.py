@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, Message, InlineKeyboardButton, InlineKeyboardMarkup
 
 # ─────────────────────────── config ───────────────────────────
 
@@ -368,6 +368,30 @@ def _get_author_user_id(msg: Message) -> int | None:
     if msg.from_user:
         return msg.from_user.id
     return None
+
+
+# ─────────────────────────── message link ─────────────────────
+
+def _get_message_link(chat_id: int, message_id: int) -> str:
+    """Генерирует ссылку на сообщение в Telegram."""
+    # Для супергрупп chat_id начинается с -100, нужно убрать это
+    if chat_id < 0:
+        # Убираем -100 из начала
+        chat_id_str = str(chat_id)
+        if chat_id_str.startswith("-100"):
+            chat_id_clean = chat_id_str[4:]
+        else:
+            chat_id_clean = chat_id_str[1:]  # Убираем только минус
+        return f"https://t.me/c/{chat_id_clean}/{message_id}"
+    else:
+        return f"https://t.me/c/{chat_id}/{message_id}"
+
+
+def _create_quote_keyboard(chat_id: int, message_id: int) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру с кнопкой-ссылкой на оригинальное сообщение."""
+    link = _get_message_link(chat_id, message_id)
+    button = InlineKeyboardButton(text="💬 К сообщению", url=link)
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 
 # ─────────────────────────── watermark ────────────────────────
@@ -870,12 +894,16 @@ async def cmd_quote(message: Message) -> None:
 
     thread_id = SUPERCHAT_TO_THREAD_MAP.get(message.chat.id, QUOTE_THREAD_ID)
 
+    # Создаём клавиатуру с ссылкой на оригинальное сообщение
+    keyboard = _create_quote_keyboard(message.chat.id, reply.message_id)
+
     try:
         photo = FSInputFile(img_path)
         await message.bot.send_photo(
             chat_id=message.chat.id,
             photo=photo,
             message_thread_id=thread_id,
+            reply_markup=keyboard,
         )
     except Exception as exc:
         log.error("Failed to send photo: %s", exc, exc_info=True)
