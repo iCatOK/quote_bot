@@ -3,13 +3,16 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import resource
 import tempfile
 import time
-import math
+import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,7 +22,29 @@ from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InlineQueryResultPhoto,
+    InputTextMessageContent,
+    Message,
+)
+
+try:
+    # ВАЖНО:
+    # код ниже рассчитан на GitHub-версию PinterestDownloader (main),
+    # а не на PyPI 2.x, у которой другой API.
+    from pinterest_downloader import Pinterest
+except ImportError as exc:
+    raise RuntimeError(
+        "Не найден пакет `pinterest_downloader`.\n"
+        "Установите GitHub-версию:\n"
+        "pip install 'git+https://github.com/x7007x/PinterestDownloader.git'"
+    ) from exc
+
 
 # ─────────────────────────── config ───────────────────────────
 
@@ -38,7 +63,7 @@ FONT_DIR = Path("./fonts")
 FONT_PATH = FONT_DIR / "Caveat-Bold.ttf"
 FONT_URL = "https://github.com/googlefonts/caveat/raw/main/fonts/ttf/Caveat-Bold.ttf"
 
-# Шрифт для водяного знака (нерукописный)
+# Шрифт для водяного знака
 WATERMARK_FONT_PATH = FONT_DIR / "Roboto-Regular.ttf"
 WATERMARK_FONT_URL = "https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf"
 WATERMARK_TEXT = "@chpi_quote_bot"
@@ -84,6 +109,18 @@ MAX_WORKERS = 4
 
 IMAGE_GEN_SEMAPHORE = asyncio.Semaphore(MAX_SEMAPHORE_COUNT)
 IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="img_gen")
+
+# Inline Pinterest search
+INLINE_PAGE_SIZE = 50
+INLINE_CACHE_TTL_SECONDS = 15 * 60
+INLINE_MAX_PAGES = 100
+PINTEREST_SEARCH_WORKERS = 4
+
+PINTEREST_SEARCH_SEMAPHORE = asyncio.Semaphore(PINTEREST_SEARCH_WORKERS)
+PINTEREST_SEARCH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=PINTEREST_SEARCH_WORKERS,
+    thread_name_prefix="pin_search",
+)
 
 
 # ─────────────────────────── profiling helpers ────────────────
@@ -394,6 +431,403 @@ def _create_quote_keyboard(chat_id: int, message_id: int) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=[[button]])
 
 
+# ─────────────────────────── inline pinterest search ──────────
+
+@dataclass
+class PinterestInlinePage:
+    items: list[dict]
+    next_bookmark: str | None
+
+
+@dataclass
+class CachedPinterestQuery:
+    updated_at: float
+    bookmarks: dict[int, str | None] = field(default_factory=lambda: {0: None})
+    pages: dict[int, list[dict]] = field(default_factory=dict)
+    has_more: dict[int, bool] = field(default_factory=dict)
+
+
+def _truncate(text: str | None, limit: int) -> str | None:
+    if not text:
+        return None
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _looks_like_jpeg(url: str | None) -> bool:
+    if not url:
+        return False
+    path = urllib.parse.urlparse(url).path.lower()
+    return path.endswith(".jpg") or path.endswith(".jpeg")
+
+
+def _extract_search_pin_images(raw_pin: dict) -> dict[str, dict]:
+    images: dict[str, dict] = {}
+
+    raw_images = raw_pin.get("images")
+    if isinstance(raw_images, dict):
+        for size, meta in raw_images.items():
+            if isinstance(meta, dict) and meta.get("url"):
+                images[str(size)] = {
+                    "url": meta["url"],
+                    "width": meta.get("width"),
+                    "height": meta.get("height"),
+                }
+            elif isinstance(meta, str) and meta:
+                images[str(size)] = {"url": meta, "width": None, "height": None}
+
+    for key, val in raw_pin.items():
+        if key.startswith("images_") and isinstance(val, dict) and val.get("url"):
+            size = key.replace("images_", "")
+            images.setdefault(size, {
+                "url": val["url"],
+                "width": val.get("width"),
+                "height": val.get("height"),
+            })
+
+    flat_candidates = (
+        ("orig", raw_pin.get("imageLargeUrl") or raw_pin.get("image_xlarge_url")),
+        ("736x", raw_pin.get("image_medium_url") or raw_pin.get("imageMediumUrl")),
+        ("474x", raw_pin.get("image_large_url") or raw_pin.get("imageLargeUrl")),
+        ("236x", raw_pin.get("image_small_url") or raw_pin.get("imageSmallUrl")),
+    )
+
+    for size, url in flat_candidates:
+        if isinstance(url, str) and url:
+            images.setdefault(size, {"url": url, "width": None, "height": None})
+
+    return images
+
+
+def _pick_image(
+    images: dict[str, dict],
+    preferred_sizes: tuple[str, ...],
+    jpeg_only: bool = False,
+) -> dict | None:
+    for size in preferred_sizes:
+        item = images.get(size)
+        if not item:
+            continue
+        url = item.get("url")
+        if not url:
+            continue
+        if jpeg_only and not _looks_like_jpeg(url):
+            continue
+        return item
+
+    for item in images.values():
+        url = item.get("url")
+        if not url:
+            continue
+        if jpeg_only and not _looks_like_jpeg(url):
+            continue
+        return item
+
+    return None
+
+
+def _normalize_search_pin(raw_pin: dict) -> dict | None:
+    pin_id = str(raw_pin.get("id") or raw_pin.get("pin_id") or "").strip()
+    if not pin_id:
+        return None
+
+    images = _extract_search_pin_images(raw_pin)
+
+    photo_meta = (
+        _pick_image(images, ("736x", "564x", "474x", "orig", "1200x"), jpeg_only=True)
+        or _pick_image(images, ("736x", "564x", "474x", "orig", "1200x"))
+    )
+    thumb_meta = (
+        _pick_image(images, ("236x", "474x", "564x", "736x"), jpeg_only=True)
+        or _pick_image(images, ("236x", "474x", "564x", "736x"))
+        or photo_meta
+    )
+
+    if not photo_meta or not thumb_meta:
+        return None
+
+    photo_url = photo_meta.get("url")
+    thumb_url = thumb_meta.get("url")
+    if not photo_url or not thumb_url:
+        return None
+
+    title = (
+        raw_pin.get("title")
+        or raw_pin.get("grid_title")
+        or raw_pin.get("seo_description")
+        or raw_pin.get("description")
+        or "Pinterest"
+    )
+    description = raw_pin.get("description") or raw_pin.get("seo_description") or ""
+
+    return {
+        "pin_id": pin_id,
+        "photo_url": photo_url,
+        "thumbnail_url": thumb_url,
+        "width": photo_meta.get("width"),
+        "height": photo_meta.get("height"),
+        "title": _truncate(title, 80),
+        "description": _truncate(description, 120),
+        "pin_link": f"https://www.pinterest.com/pin/{pin_id}/",
+    }
+
+
+class PinterestSearchPager(Pinterest):
+    """
+    Обёртка над PinterestDownloader (GitHub main) с поддержкой:
+    - поиска картинок по запросу,
+    - bookmarks-пагинации,
+    - выдачи сырых image-URL для Telegram inline mode.
+    """
+
+    def _bootstrap_session(self) -> tuple[str, str]:
+        self._fetch("https://www.pinterest.com/")
+        csrf = ""
+        for c in self._cj:
+            if c.name == "csrftoken":
+                csrf = c.value
+                break
+        cookies = "; ".join(f"{c.name}={c.value}" for c in self._cj)
+        return csrf, cookies
+
+    @staticmethod
+    def _extract_next_bookmark(payload: dict) -> str | None:
+        rr = payload.get("resource_response", {}) if isinstance(payload, dict) else {}
+        bookmark = rr.get("bookmark")
+
+        if not bookmark:
+            bookmarks = rr.get("bookmarks")
+            if isinstance(bookmarks, list) and bookmarks:
+                bookmark = bookmarks[0]
+            elif isinstance(bookmarks, str):
+                bookmark = bookmarks
+
+        if bookmark in (None, "", "-end-"):
+            return None
+        return bookmark
+
+    @staticmethod
+    def _extract_results(payload: dict) -> list[dict]:
+        rr = payload.get("resource_response", {}) if isinstance(payload, dict) else {}
+        data = rr.get("data", {})
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            results = data.get("results")
+            if isinstance(results, list):
+                return results
+        return []
+
+    def _common_headers(
+        self,
+        query: str,
+        csrf: str,
+        cookies: str,
+        source_url: str,
+    ) -> dict[str, str]:
+        return {
+            "User-Agent": self._ua,
+            "Accept": "application/json, text/javascript, */*, q=0.01",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRFToken": csrf,
+            "X-Pinterest-AppState": "active",
+            "X-Pinterest-Source-Url": source_url,
+            "Cookie": cookies,
+            "Referer": f"https://www.pinterest.com{source_url}",
+        }
+
+    def _search_get(self, query: str, bookmark: str | None, limit: int) -> dict:
+        csrf, cookies = self._bootstrap_session()
+
+        source_url = f"/search/pins/?q={urllib.parse.quote(query)}"
+        payload = {
+            "options": {
+                "query": query,
+                "scope": "pins",
+                "page_size": limit,
+                "bookmarks": [bookmark] if bookmark else [],
+            },
+            "context": {},
+        }
+
+        params = urllib.parse.urlencode({
+            "source_url": source_url,
+            "data": json.dumps(payload, separators=(",", ":")),
+        })
+        url = f"https://www.pinterest.com/resource/BaseSearchResource/get/?{params}"
+
+        req = urllib.request.Request(url, headers=self._common_headers(query, csrf, cookies, source_url))
+        resp = self._opener.open(req, timeout=self._timeout)
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def _search_post(self, query: str, bookmark: str | None, limit: int) -> dict:
+        csrf, cookies = self._bootstrap_session()
+
+        source_url = f"/search/pins/?q={urllib.parse.quote(query)}"
+        payload = {
+            "options": {
+                "query": query,
+                "scope": "pins",
+                "page_size": limit,
+                "bookmarks": [bookmark] if bookmark else [],
+            },
+            "context": {},
+        }
+
+        body = urllib.parse.urlencode({
+            "source_url": source_url,
+            "data": json.dumps(payload, separators=(",", ":")),
+        }).encode("utf-8")
+
+        headers = self._common_headers(query, csrf, cookies, source_url)
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+
+        req = urllib.request.Request(
+            "https://www.pinterest.com/resource/BaseSearchResource/get/",
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        resp = self._opener.open(req, timeout=self._timeout)
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    def search_page(
+        self,
+        query: str,
+        bookmark: str | None = None,
+        limit: int = INLINE_PAGE_SIZE,
+    ) -> PinterestInlinePage:
+        query = query.strip()
+        if not query:
+            return PinterestInlinePage(items=[], next_bookmark=None)
+
+        last_exc: Exception | None = None
+        payload: dict | None = None
+
+        for method in (self._search_get, self._search_post):
+            try:
+                payload = method(query, bookmark, limit)
+                break
+            except Exception as exc:
+                last_exc = exc
+                log.warning("Pinterest search method %s failed: %s", method.__name__, exc)
+
+        if payload is None:
+            raise RuntimeError(f"Pinterest search failed: {last_exc}")
+
+        raw_results = self._extract_results(payload)
+        next_bookmark = self._extract_next_bookmark(payload)
+
+        items: list[dict] = []
+        seen_pin_ids: set[str] = set()
+
+        for raw_pin in raw_results:
+            if not isinstance(raw_pin, dict):
+                continue
+            pin = _normalize_search_pin(raw_pin)
+            if not pin:
+                continue
+            if pin["pin_id"] in seen_pin_ids:
+                continue
+            seen_pin_ids.add(pin["pin_id"])
+            items.append(pin)
+
+        if next_bookmark == bookmark:
+            next_bookmark = None
+
+        return PinterestInlinePage(items=items, next_bookmark=next_bookmark)
+
+
+class PinterestInlineSearchService:
+    def __init__(self, ttl_seconds: int, page_size: int):
+        self.ttl_seconds = ttl_seconds
+        self.page_size = page_size
+        self._cache: dict[tuple[int, str], CachedPinterestQuery] = {}
+        self._lock = asyncio.Lock()
+
+    def _cleanup(self) -> None:
+        now = time.time()
+        expired = [
+            key for key, value in self._cache.items()
+            if now - value.updated_at > self.ttl_seconds
+        ]
+        for key in expired:
+            del self._cache[key]
+
+    def _fetch_page_sync(self, query: str, bookmark: str | None) -> PinterestInlinePage:
+        client = PinterestSearchPager()
+        return client.search_page(query=query, bookmark=bookmark, limit=self.page_size)
+
+    async def _fetch_page(self, query: str, bookmark: str | None) -> PinterestInlinePage:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            PINTEREST_SEARCH_EXECUTOR,
+            self._fetch_page_sync,
+            query,
+            bookmark,
+        )
+
+    async def get_page(
+        self,
+        user_id: int,
+        query: str,
+        page: int,
+    ) -> tuple[list[dict], bool]:
+        page = max(0, min(page, INLINE_MAX_PAGES - 1))
+        key = (user_id, query.casefold())
+
+        async with self._lock:
+            self._cleanup()
+
+            session = self._cache.get(key)
+            if session is None:
+                session = CachedPinterestQuery(updated_at=time.time())
+                self._cache[key] = session
+            else:
+                session.updated_at = time.time()
+
+            current_page = 0
+            while current_page <= page:
+                if current_page in session.pages:
+                    current_page += 1
+                    continue
+
+                if current_page > 0 and not session.has_more.get(current_page - 1, True):
+                    session.pages[current_page] = []
+                    session.has_more[current_page] = False
+                    break
+
+                bookmark = session.bookmarks.get(current_page)
+                result = await self._fetch_page(query, bookmark)
+
+                session.pages[current_page] = result.items
+                session.has_more[current_page] = bool(result.next_bookmark and result.items)
+                session.bookmarks[current_page + 1] = result.next_bookmark
+                current_page += 1
+
+            return (
+                session.pages.get(page, []),
+                session.has_more.get(page, False),
+            )
+
+
+PINTEREST_INLINE_SERVICE = PinterestInlineSearchService(
+    ttl_seconds=INLINE_CACHE_TTL_SECONDS,
+    page_size=INLINE_PAGE_SIZE,
+)
+
+
+def _create_pinterest_result_keyboard(pin_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📌 Открыть в Pinterest", url=pin_url)]
+        ]
+    )
+
+
 # ─────────────────────────── watermark ────────────────────────
 
 def _draw_watermark(img: Image.Image, draw: ImageDraw.ImageDraw) -> None:
@@ -552,12 +986,12 @@ def _draw_line_with_shadow(
             if em_img is not None:
                 # Полупрозрачная тень под эмодзи
                 for sx, sy, sa in ((3, 3, 60), (1, 1, 40)):
-                    shadow = Image.new("RGBA", em_img.size, (*BG_COLOR, 0))
-                    # Тень = тёмное изображение с маской от альфа-канала эмодзи
                     dark_layer = Image.new("RGBA", em_img.size, (*BG_COLOR, sa))
-                    shadow = Image.composite(dark_layer,
-                                            Image.new("RGBA", em_img.size, (0, 0, 0, 0)),
-                                            em_img.split()[3])
+                    shadow = Image.composite(
+                        dark_layer,
+                        Image.new("RGBA", em_img.size, (0, 0, 0, 0)),
+                        em_img.split()[3],
+                    )
                     img.paste(shadow, (current_x + sx, emoji_y + sy), shadow)
                 img.paste(em_img, (current_x, emoji_y), em_img)
                 em_img.close()
@@ -919,6 +1353,121 @@ async def cmd_quote(message: Message) -> None:
             pass
 
 
+@router.inline_query()
+async def inline_pinterest_search(inline_query: InlineQuery) -> None:
+    query = (inline_query.query or "").strip()
+
+    if not query:
+        await inline_query.answer(
+            results=[
+                InlineQueryResultArticle(
+                    id="inline_help",
+                    title="Введите запрос для поиска в Pinterest",
+                    description="Например: cats, nature wallpaper, room design",
+                    input_message_content=InputTextMessageContent(
+                        message_text=(
+                            "Введите запрос после имени бота в inline-режиме.\n\n"
+                            "Пример:\n"
+                            "@chpi_quote_bot cats"
+                        )
+                    ),
+                )
+            ],
+            cache_time=1,
+            is_personal=True,
+        )
+        return
+
+    try:
+        page = int(inline_query.offset) if inline_query.offset else 0
+    except ValueError:
+        page = 0
+
+    page = max(0, min(page, INLINE_MAX_PAGES - 1))
+
+    log.info(
+        "Inline Pinterest search user_id=%d query=%r page=%d",
+        inline_query.from_user.id,
+        query,
+        page,
+    )
+
+    async with PINTEREST_SEARCH_SEMAPHORE:
+        try:
+            pins, has_more = await PINTEREST_INLINE_SERVICE.get_page(
+                user_id=inline_query.from_user.id,
+                query=query,
+                page=page,
+            )
+        except Exception as exc:
+            log.error("Inline Pinterest search failed: %s", exc, exc_info=True)
+            await inline_query.answer(
+                results=[
+                    InlineQueryResultArticle(
+                        id="inline_error",
+                        title="Не удалось выполнить поиск",
+                        description="Попробуйте повторить запрос чуть позже",
+                        input_message_content=InputTextMessageContent(
+                            message_text="Ошибка поиска Pinterest. Попробуйте позже."
+                        ),
+                    )
+                ],
+                cache_time=1,
+                is_personal=True,
+            )
+            return
+
+    results: list[InlineQueryResultPhoto] = []
+    for idx, pin in enumerate(pins[:INLINE_PAGE_SIZE]):
+        result_id = hashlib.md5(
+            f"{pin['pin_id']}:{page}:{idx}:{query}".encode("utf-8")
+        ).hexdigest()
+
+        kwargs = {}
+        if isinstance(pin.get("width"), int):
+            kwargs["photo_width"] = pin["width"]
+        if isinstance(pin.get("height"), int):
+            kwargs["photo_height"] = pin["height"]
+
+        results.append(
+            InlineQueryResultPhoto(
+                id=result_id,
+                photo_url=pin["photo_url"],
+                thumbnail_url=pin["thumbnail_url"],
+                title=pin.get("title"),
+                description=pin.get("description"),
+                reply_markup=_create_pinterest_result_keyboard(pin["pin_link"]),
+                **kwargs,
+            )
+        )
+
+    if not results:
+        await inline_query.answer(
+            results=[
+                InlineQueryResultArticle(
+                    id=f"no_results_{hashlib.md5(query.encode()).hexdigest()}",
+                    title="Ничего не найдено",
+                    description="Попробуйте изменить запрос",
+                    input_message_content=InputTextMessageContent(
+                        message_text=f"По запросу «{query}» ничего не найдено."
+                    ),
+                )
+            ],
+            cache_time=5,
+            is_personal=True,
+        )
+        return
+
+    next_offset = str(page + 1) if has_more and (page + 1) < INLINE_MAX_PAGES else ""
+
+    await inline_query.answer(
+        results=results,
+        cache_time=30,
+        is_personal=True,
+        next_offset=next_offset,
+    )
+
+
 @router.message(Command("цитата"))
 async def cmd_quote_wrong_thread(message: Message) -> None:
     log.debug(
@@ -934,11 +1483,13 @@ async def on_startup(bot: Bot) -> None:
     me = await bot.get_me()
     log.info("Bot started: @%s (id=%d)", me.username, me.id)
     log.info("Initial RSS: %.1f MB", _get_rss_mb())
+    log.info("supports_inline_queries=%s", getattr(me, "supports_inline_queries", None))
 
 
 async def on_shutdown(bot: Bot) -> None:
     log.info("Bot shutting down, RSS: %.1f MB", _get_rss_mb())
     IMAGE_EXECUTOR.shutdown(wait=False)
+    PINTEREST_SEARCH_EXECUTOR.shutdown(wait=False)
     await bot.session.close()
 
 
@@ -963,7 +1514,7 @@ async def main() -> None:
     dp.shutdown.register(on_shutdown)
 
     log.info("Starting polling …")
-    await dp.start_polling(bot, allowed_updates=["message"])
+    await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 
 if __name__ == "__main__":
