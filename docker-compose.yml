@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  quote-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quote_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - bg_cache:/app/bg_cache
+      - emoji_cache:/app/emoji_cache
+      - fonts_cache:/app/fonts
+    command: ["python", "main.py"]
+
+volumes:
+  bg_cache:
+  emoji_cache:
+  fonts_cache:
