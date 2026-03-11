@@ -13,9 +13,11 @@ services:
       - bg_cache:/app/bg_cache
       - emoji_cache:/app/emoji_cache
       - fonts_cache:/app/fonts
+      - whisper_cache:/root/.cache/huggingface
     command: ["python", "main.py"]
 
 volumes:
   bg_cache:
   emoji_cache:
   fonts_cache:
+  whisper_cache:
