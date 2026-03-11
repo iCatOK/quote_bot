@@ -12,13 +12,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libjpeg62-turbo-dev \
     zlib1g-dev \
+    libgomp1 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
 
 RUN pip install --upgrade pip && pip install -r /app/requirements.txt
 
-COPY main.py /app/main.py
+COPY . .
 
 # Создаём каталоги для кэша заранее
 RUN mkdir -p /app/bg_cache /app/emoji_cache /app/fonts

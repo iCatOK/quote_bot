@@ -3,3 +3,5 @@ Pillow>=10.3
 emoji>=2.14.0
 python-dotenv>=1.0
 git+https://github.com/x7007x/PinterestDownloader.git
+aiofiles
+faster-whisper
