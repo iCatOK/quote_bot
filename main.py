@@ -33,8 +33,6 @@ from aiogram.types import (
     Message,
 )
 
-from routers.voice_router import router as voice_router, get_whisper_model
-
 try:
     # ВАЖНО:
     # код ниже рассчитан на GitHub-версию PinterestDownloader (main),
@@ -129,7 +127,7 @@ PINTEREST_SEARCH_EXECUTOR = ThreadPoolExecutor(
 
 def _get_memory_mb() -> float:
     try:
-        usage = resource.getrusage(resource.RUSAGE_SELF)
+        usage = resourceю(resource.RUSAGE_SELF)
         rss_kb = usage.ru_maxrss
         if os.uname().sysname == "Darwin":
             return rss_kb / 1024 / 1024
@@ -1487,10 +1485,6 @@ async def on_startup(bot: Bot) -> None:
     log.info("Bot started: @%s (id=%d)", me.username, me.id)
     log.info("Initial RSS: %.1f MB", _get_rss_mb())
     log.info("supports_inline_queries=%s", getattr(me, "supports_inline_queries", None))
-    
-    log.info("Whisper model preloading...")
-    await asyncio.to_thread(get_whisper_model)
-    log.info("Whisper model ready for use")
 
 
 async def on_shutdown(bot: Bot) -> None:
@@ -1520,7 +1514,6 @@ async def main() -> None:
     dp.shutdown.register(on_shutdown)
     
     dp.include_router(router)
-    dp.include_router(voice_router)
 
     log.info("Starting polling …")
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
