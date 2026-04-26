@@ -54,6 +54,8 @@ except ImportError as exc:
 load_dotenv()
 
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
+VPN_LOGIN: str = os.environ["VPN_LOGIN"]
+VPN_PASS: str = os.environ["VPN_PASS"]
 
 SUPERCHAT_TO_THREAD_MAP = {
     -1002692670592: 188271,
@@ -1511,7 +1513,7 @@ async def main() -> None:
         _load_font(size)
     log.info("Font cache warmed up (%d entries)", _load_font.cache_info().currsize)
 
-    session = AiohttpSession(proxy="socks5://host.docker.internal:9090")
+    session = AiohttpSession(proxy=f"socks5://{VPN_LOGIN}:{VPN_PASS}@host.docker.internal:9090")
     bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
     dp.startup.register(on_startup)
