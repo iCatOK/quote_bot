@@ -33,6 +33,9 @@ from aiogram.types import (
     Message,
 )
 
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp_socks import ProxyConnector
+
 try:
     # ВАЖНО:
     # код ниже рассчитан на GitHub-версию PinterestDownloader (main),
@@ -1508,7 +1511,8 @@ async def main() -> None:
         _load_font(size)
     log.info("Font cache warmed up (%d entries)", _load_font.cache_info().currsize)
 
-    bot = Bot(token=BOT_TOKEN)
+    session = AiohttpSession(proxy="socks5://host.docker.internal:9090")
+    bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
