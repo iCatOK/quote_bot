@@ -35,6 +35,7 @@ from aiogram.types import (
 
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiohttp_socks import ProxyConnector
+from aiohttp import BasicAuth
 
 try:
     # ВАЖНО:
@@ -1513,7 +1514,8 @@ async def main() -> None:
         _load_font(size)
     log.info("Font cache warmed up (%d entries)", _load_font.cache_info().currsize)
 
-    session = AiohttpSession(proxy=f"socks5://{VPN_LOGIN}:{VPN_PASS}@host.docker.internal:9090")
+    auth = BasicAuth(login=VPN_LOGIN, password=VPN_PASS)
+    session = AiohttpSession(proxy=("socks5://host.docker.internal:9090", auth))
     bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
     dp.startup.register(on_startup)
