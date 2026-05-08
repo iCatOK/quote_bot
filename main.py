@@ -62,7 +62,7 @@ QUOTE_THREAD_ID: int = int(os.environ["QUOTE_THREAD_ID"])
 
 # Webhook config (для Render)
 WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "10000"))  # Render использует PORT env
+WEBHOOK_PORT = int(os.environ.get("PORT", "10000"))  # Render использует PORT env
 WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Полный URL для webhook
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
