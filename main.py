@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from supabase import create_client, Client as SupabaseClient
 
 import emoji as emoji_lib
 from dotenv import load_dotenv
@@ -67,6 +68,11 @@ WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Полный URL для webhook
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 BOT_MODE = os.environ.get("BOT_MODE", "webhook")  # "webhook" или "polling"
+
+# Supabase config
+SUPABASE_URL: str = os.environ["SUPABASE_URL"]
+SUPABASE_KEY: str = os.environ["SUPABASE_KEY"]
+SUPABASE_BUCKET: str = os.environ.get("SUPABASE_BUCKET", "quote-backgrounds")
 
 FONT_DIR = Path("./fonts")
 FONT_PATH = FONT_DIR / "Caveat-Bold.ttf"
@@ -131,6 +137,92 @@ PINTEREST_SEARCH_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="pin_search",
 )
 
+# ─────────────────────────── supabase client ──────────────────
+
+def _get_supabase() -> SupabaseClient:
+    """Возвращает синхронный Supabase-клиент (создаётся один раз через lru_cache)."""
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Создаём клиент один раз при старте
+_supabase_client: SupabaseClient = _get_supabase()
+
+
+# ─────────────────────────── supabase storage helpers ─────────
+
+def _supabase_retry(fn, retries: int = 3, delay: float = 1.5):
+    """Повторяет вызов fn при сетевых ошибках."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Supabase retry %d/%d: %s", attempt + 1, retries, exc)
+            if attempt < retries - 1:
+                time.sleep(delay)
+    if last_exc:
+        raise last_exc
+
+
+def supabase_upload_image(local_path: str, storage_path: str) -> str:
+    with open(local_path, "rb") as f:
+        data = f.read()
+    mime = "image/jpeg" if local_path.lower().endswith(".jpg") else "image/png"
+
+    def _do():
+        _supabase_client.storage.from_(SUPABASE_BUCKET).upload(
+            path=storage_path,
+            file=data,
+            file_options={"content-type": mime, "upsert": "true"},
+        )
+
+    _supabase_retry(_do)
+    log.info("Supabase: uploaded %s → %s", local_path, storage_path)
+    return _supabase_client.storage.from_(SUPABASE_BUCKET).get_public_url(storage_path)
+
+
+def supabase_download_image(storage_path: str, local_path: str) -> None:
+    def _do():
+        data: bytes = _supabase_client.storage.from_(SUPABASE_BUCKET).download(storage_path)
+        with open(local_path, "wb") as f:
+            f.write(data)
+
+    _supabase_retry(_do)
+    log.info("Supabase: downloaded %s → %s", storage_path, local_path)
+
+
+def supabase_delete_image(storage_path: str) -> None:
+    """
+    Удаляет файл из Supabase Storage.
+    storage_path — путь внутри бакета.
+    """
+    try:
+        _supabase_client.storage.from_(SUPABASE_BUCKET).remove([storage_path])
+        log.info("Supabase: deleted %s", storage_path)
+    except Exception as exc:
+        log.error("Supabase delete failed (%s): %s", storage_path, exc)
+        raise
+
+
+def supabase_image_exists(storage_path: str) -> bool:
+    """
+    Проверяет наличие файла в бакете через list().
+    Возвращает True, если файл найден.
+    """
+    try:
+        # Разбиваем путь на директорию и имя файла
+        parts = storage_path.rsplit("/", 1)
+        folder = parts[0] if len(parts) == 2 else ""
+        filename = parts[-1]
+
+        files = _supabase_client.storage.from_(SUPABASE_BUCKET).list(
+            path=folder,
+            options={"search": filename},
+        )
+        return any(f.get("name") == filename for f in (files or []))
+    except Exception as exc:
+        log.warning("Supabase exists-check failed (%s): %s", storage_path, exc)
+        return False
 
 # ─────────────────────────── profiling helpers ────────────────
 
@@ -346,19 +438,59 @@ def _avatar_file_hash(path: str) -> str:
 def _get_cached_bg(user_id: int, avatar_hash: str) -> str | None:
     meta = _load_bg_meta()
     entry = meta.get(str(user_id))
+    
     if not entry:
+        filename = f"bg_{user_id}.png"
+        storage_path = f"bg_cache/{filename}"
+        cached_path = BG_CACHE_DIR / filename
+        if supabase_image_exists(storage_path):
+            try:
+                supabase_download_image(storage_path, str(cached_path))
+                # Восстанавливаем мету
+                meta[str(user_id)] = {
+                    "hash": avatar_hash,
+                    "file": filename,
+                    "updated": time.time(),
+                }
+                _save_bg_meta(meta)
+                log.info("Restored lost meta from Supabase for user %d", user_id)
+                return str(cached_path)
+            except Exception as exc:
+                log.warning("Supabase meta restore failed for user %d: %s", user_id, exc)
         return None
+    
     if entry.get("hash") != avatar_hash:
-        old_path = BG_CACHE_DIR / entry.get("file", "")
+        old_file = entry.get("file", "")
+        old_path = BG_CACHE_DIR / old_file
         if old_path.exists():
             old_path.unlink()
-            log.info("Removed stale bg cache: %s", old_path)
+            log.info("Removed stale local bg cache: %s", old_path)
+        # Удаляем и из Supabase
+        if old_file:
+            try:
+                supabase_delete_image(f"bg_cache/{old_file}")
+            except Exception as exc:
+                log.warning("Supabase stale bg delete failed: %s", exc)
         del meta[str(user_id)]
         _save_bg_meta(meta)
         return None
+    
     cached_path = BG_CACHE_DIR / entry["file"]
+    
     if cached_path.exists():
         return str(cached_path)
+
+    # Локальный файл пропал (например, после редеплоя на Render) —
+    # пробуем восстановить из Supabase
+    storage_path = f"bg_cache/{entry['file']}"
+    if supabase_image_exists(storage_path):
+        try:
+            supabase_download_image(storage_path, str(cached_path))
+            log.info("Restored bg from Supabase for user %d", user_id)
+            return str(cached_path)
+        except Exception as exc:
+            log.warning("Supabase restore failed for user %d: %s", user_id, exc)
+    
     return None
 
 
@@ -366,6 +498,15 @@ def _save_bg_to_cache(user_id: int, avatar_hash: str, bg_img: Image.Image) -> st
     filename = f"bg_{user_id}.png"
     path = BG_CACHE_DIR / filename
     bg_img.save(str(path), "PNG", optimize=True)
+
+    # ── Supabase Storage ─────────────────────────────────────
+    storage_path = f"bg_cache/{filename}"
+    try:
+        supabase_upload_image(str(path), storage_path)
+    except Exception as exc:
+        log.warning("Supabase bg upload skipped: %s", exc)
+    # ─────────────────────────────────────────────────────────
+
     meta = _load_bg_meta()
     meta[str(user_id)] = {
         "hash": avatar_hash,
@@ -1517,6 +1658,13 @@ async def on_shutdown(bot: Bot) -> None:
     log.info("Bot shutting down, RSS: %.1f MB", _get_rss_mb())
     IMAGE_EXECUTOR.shutdown(wait=False)
     PINTEREST_SEARCH_EXECUTOR.shutdown(wait=False)
+
+    try:
+        _supabase_client.auth.sign_out()
+        log.info("Supabase client closed")
+    except Exception as e:
+        log.warning("Supabase client close failed: %s", e)
+
     await bot.session.close()
 
 
@@ -1525,6 +1673,12 @@ async def on_shutdown_webhook(bot: Bot) -> None:
     log.info("Bot shutting down (webhook), RSS: %.1f MB", _get_rss_mb())
     IMAGE_EXECUTOR.shutdown(wait=False)
     PINTEREST_SEARCH_EXECUTOR.shutdown(wait=False)
+
+    try:
+        _supabase_client.auth.sign_out()
+        log.info("Supabase client closed")
+    except Exception as e:
+        log.warning("Supabase client close failed: %s", e)
     
     # Удаляем webhook при остановке
     try:
@@ -1568,7 +1722,15 @@ def warmup_cache() -> None:
         _load_font(size)
     for size in (28, 32, 36, 40, 44, 48, 52, 56, 60):
         _load_font(size)
+
     log.info("Font cache warmed up (%d entries)", _load_font.cache_info().currsize)
+
+    # Проверяем подключение к Supabase
+    try:
+        _supabase_client.storage.list_buckets()
+        log.info("Supabase Storage: connection OK, bucket='%s'", SUPABASE_BUCKET)
+    except Exception as exc:
+        log.error("Supabase Storage: connection FAILED: %s", exc)
 
 
 async def main_polling() -> None:
