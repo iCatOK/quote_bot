@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: quote-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: QUOTE_THREAD_ID
+        sync: false
+      - key: BOT_MODE
+        value: webhook
+      - key: WEBHOOK_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: WEBHOOK_PATH
+        value: /webhook
+      - key: WEBHOOK_HOST
+        value: 0.0.0.0
+      - key: PYTHON_VERSION
+        value: 3.11
+    healthCheckPath: /health

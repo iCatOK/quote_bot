@@ -8,7 +8,6 @@ import os
 import resource
 import tempfile
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +19,7 @@ import emoji as emoji_lib
 from dotenv import load_dotenv
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
@@ -32,10 +32,7 @@ from aiogram.types import (
     InputTextMessageContent,
     Message,
 )
-
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp_socks import ProxyConnector
-from aiohttp import BasicAuth
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 try:
     # ВАЖНО:
@@ -55,8 +52,6 @@ except ImportError as exc:
 load_dotenv()
 
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
-VPN_LOGIN: str = os.environ["VPN_LOGIN"]
-VPN_PASS: str = os.environ["VPN_PASS"]
 
 SUPERCHAT_TO_THREAD_MAP = {
     -1002692670592: 188271,
@@ -64,6 +59,14 @@ SUPERCHAT_TO_THREAD_MAP = {
 }
 
 QUOTE_THREAD_ID: int = int(os.environ["QUOTE_THREAD_ID"])
+
+# Webhook config (для Render)
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "0.0.0.0")
+WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "10000"))  # Render использует PORT env
+WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Полный URL для webhook
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+BOT_MODE = os.environ.get("BOT_MODE", "webhook")  # "webhook" или "polling"
 
 FONT_DIR = Path("./fonts")
 FONT_PATH = FONT_DIR / "Caveat-Bold.ttf"
@@ -133,7 +136,7 @@ PINTEREST_SEARCH_EXECUTOR = ThreadPoolExecutor(
 
 def _get_memory_mb() -> float:
     try:
-        usage = resourceю(resource.RUSAGE_SELF)
+        usage = resource(resource.RUSAGE_SELF)
         rss_kb = usage.ru_maxrss
         if os.uname().sysname == "Darwin":
             return rss_kb / 1024 / 1024
@@ -1487,10 +1490,27 @@ async def cmd_quote_wrong_thread(message: Message) -> None:
 
 async def on_startup(bot: Bot) -> None:
     me = await bot.get_me()
-    
     log.info("Bot started: @%s (id=%d)", me.username, me.id)
     log.info("Initial RSS: %.1f MB", _get_rss_mb())
     log.info("supports_inline_queries=%s", getattr(me, "supports_inline_queries", None))
+
+
+async def on_startup_webhook(bot: Bot) -> None:
+    """Startup hook для webhook режима - устанавливает webhook URL"""
+    me = await bot.get_me()
+    log.info("Bot starting (webhook): @%s (id=%d)", me.username, me.id)
+    log.info("Initial RSS: %.1f MB", _get_rss_mb())
+    log.info("supports_inline_queries=%s", getattr(me, "supports_inline_queries", None))
+    
+    if WEBHOOK_URL:
+        await bot.set_webhook(
+            url=WEBHOOK_URL,
+            secret_token=WEBHOOK_SECRET or None,
+            allowed_updates=["message", "inline_query"]
+        )
+        log.info("Webhook set to: %s", WEBHOOK_URL)
+    else:
+        log.warning("WEBHOOK_URL not set, skipping webhook registration")
 
 
 async def on_shutdown(bot: Bot) -> None:
@@ -1500,9 +1520,45 @@ async def on_shutdown(bot: Bot) -> None:
     await bot.session.close()
 
 
+async def on_shutdown_webhook(bot: Bot) -> None:
+    """Shutdown hook для webhook режима - удаляет webhook"""
+    log.info("Bot shutting down (webhook), RSS: %.1f MB", _get_rss_mb())
+    IMAGE_EXECUTOR.shutdown(wait=False)
+    PINTEREST_SEARCH_EXECUTOR.shutdown(wait=False)
+    
+    # Удаляем webhook при остановке
+    try:
+        await bot.delete_webhook()
+        log.info("Webhook deleted")
+    except Exception as e:
+        log.warning("Failed to delete webhook: %s", e)
+    
+    await bot.session.close()
+
+
+# ─────────────────────────── health endpoint для cron-job.org ─
+
+async def health_handler(request: web.Request) -> web.Response:
+    """Health check endpoint для cron-job.org и мониторинга"""
+    return web.json_response({
+        "status": "ok",
+        "service": "quote_bot",
+        "timestamp": time.time(),
+    })
+
+
 # ─────────────────────────── entry point ──────────────────────
 
-async def main() -> None:
+def init_bot() -> tuple[Bot, Dispatcher]:
+    """Инициализация бота и диспетчера"""
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
+    return bot, dp
+
+
+def warmup_cache() -> None:
+    """Прогрев кэшей перед стартом"""
     ensure_font()
     ensure_watermark_font()
     _ensure_bg_cache_dir()
@@ -1514,18 +1570,52 @@ async def main() -> None:
         _load_font(size)
     log.info("Font cache warmed up (%d entries)", _load_font.cache_info().currsize)
 
-    auth = BasicAuth(login=VPN_LOGIN, password=VPN_PASS)
-    session = AiohttpSession(proxy=("socks5://host.docker.internal:9090", auth))
-    bot = Bot(token=BOT_TOKEN, session=session)
-    dp = Dispatcher()
+
+async def main_polling() -> None:
+    """Запуск бота в режиме polling (для локальной разработки)"""
+    warmup_cache()
+    
+    bot, dp = init_bot()
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-    
-    dp.include_router(router)
 
     log.info("Starting polling …")
     await dp.start_polling(bot, allowed_updates=["message", "inline_query"])
 
 
+def main_webhook() -> None:
+    """Запуск бота в режиме webhook через aiohttp (для Render)"""
+    warmup_cache()
+    
+    bot, dp = init_bot()
+    dp.startup.register(on_startup_webhook)
+    dp.shutdown.register(on_shutdown_webhook)
+
+    # Создаём aiohttp приложение
+    app = web.Application()
+    
+    # Health endpoint для cron-job.org (будит сервер)
+    app.router.add_get("/health", health_handler)
+    
+    # Webhook handler от aiogram
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET or None
+    )
+    webhook_handler.register(app, path=WEBHOOK_PATH)
+    
+    # Настраиваем startup/shutdown hooks
+    setup_application(app, dp, bot=bot)
+
+    # Запускаем сервер
+    port = WEBHOOK_PORT
+    log.info("Starting webhook server on %s:%d%s", WEBHOOK_HOST, port, WEBHOOK_PATH)
+    web.run_app(app, host=WEBHOOK_HOST, port=port)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if BOT_MODE == "polling":
+        asyncio.run(main_polling())
+    else:
+        main_webhook()
