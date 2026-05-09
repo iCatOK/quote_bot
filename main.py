@@ -724,13 +724,30 @@ def _normalize_search_pin(raw_pin: dict) -> dict | None:
     }
 
 
-class PinterestSearchPager(Pinterest):
+class PinterestSearchPager:
     """
-    Обёртка над PinterestDownloader (GitHub main) с поддержкой:
-    - поиска картинок по запросу,
-    - bookmarks-пагинации,
-    - выдачи сырых image-URL для Telegram inline mode.
+    Самостоятельный клиент поиска Pinterest (без наследования от Pinterest).
+    Реализует bookmark-пагинацию через внутренний API Pinterest.
     """
+
+    def __init__(self):
+        import http.cookiejar
+        self._cj = http.cookiejar.CookieJar()
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self._cj)
+        )
+        self._ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
+        self._timeout = 20
+        self._opener.addheaders = [("User-Agent", self._ua)]
+
+    def _fetch(self, url: str) -> bytes:
+        req = urllib.request.Request(url, headers={"User-Agent": self._ua})
+        resp = self._opener.open(req, timeout=self._timeout)
+        return resp.read()
 
     def _bootstrap_session(self) -> tuple[str, str]:
         self._fetch("https://www.pinterest.com/")
