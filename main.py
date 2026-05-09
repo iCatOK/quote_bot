@@ -1431,14 +1431,19 @@ async def cmd_quote(message: Message) -> None:
             f"Максимум — {MAX_QUOTE_LENGTH}."
         )
         return
-
+    
+    # Если не удаётся найти ID пользователя, то будет чёрный фон
+    status_warning = ''
+    author_user_id = _get_author_user_id(reply)
     author = _get_author(reply)
+    if author_user_id is None:
+        log.warning("Cannot get quote author's user_id (username=%r, author_user_id=%d), bg will be black", author, author_user_id)
+        status_warning = '(чёрный фон)'
 
     # Отправляем статусное сообщение
-    status_msg = await message.answer("⏳ Создаю цитату...")
+    status_msg = await message.answer(f"⏳ Создаю цитату{status_warning}...")
 
     avatar_path: str | None = None
-    author_user_id = _get_author_user_id(reply)
     if author_user_id is not None:
         avatar_path = await _download_avatar(message.bot, author_user_id)
 
@@ -1447,8 +1452,8 @@ async def cmd_quote(message: Message) -> None:
         await status_msg.edit_text("🖼 Создаю фон из аватарки (около 30-50 секунд)...")
 
     log.info(
-        "Generating quote for chat_id=%d, author=%r, author_id=%d, len=%d, avatar=%s",
-        message.chat.id, author, author_user_id, len(quote_text), "yes" if avatar_path else "no",
+        "Generating quote for chat_id=%d, author=%r, author_id=%r, len=%d, avatar=%s",
+        message.chat.id, author, str(author_user_id) or 'None', len(quote_text), "yes" if avatar_path else "no",
     )
 
     async with IMAGE_GEN_SEMAPHORE:
