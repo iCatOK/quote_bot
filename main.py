@@ -1447,8 +1447,8 @@ async def cmd_quote(message: Message) -> None:
         await status_msg.edit_text("🖼 Создаю фон из аватарки (около 30-50 секунд)...")
 
     log.info(
-        "Generating quote for chat_id=%d author=%r, len=%d, avatar=%s",
-        message.chat.id, author, len(quote_text), "yes" if avatar_path else "no",
+        "Generating quote for chat_id=%d, author=%r, author_id=%d, len=%d, avatar=%s",
+        message.chat.id, author, author_user_id, len(quote_text), "yes" if avatar_path else "no",
     )
 
     async with IMAGE_GEN_SEMAPHORE:
