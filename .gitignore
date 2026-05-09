@@ -1,0 +1,21 @@
+```gitignore
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Bot runtime files
+fonts/
+bg_cache/
+emoji_cache/
+
+# Temp files
+*.tmp
+*.jpg
+*.png
+```

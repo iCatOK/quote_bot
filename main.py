@@ -35,18 +35,6 @@ from aiogram.types import (
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-try:
-    # ВАЖНО:
-    # код ниже рассчитан на GitHub-версию PinterestDownloader (main),
-    # а не на PyPI 2.x, у которой другой API.
-    from pinterest_downloader import Pinterest
-except ImportError as exc:
-    raise RuntimeError(
-        "Не найден пакет `pinterest_downloader`.\n"
-        "Установите GitHub-версию:\n"
-        "pip install 'git+https://github.com/x7007x/PinterestDownloader.git'"
-    ) from exc
-
 
 # ─────────────────────────── config ───────────────────────────
 
