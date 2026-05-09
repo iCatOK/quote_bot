@@ -1438,6 +1438,7 @@ async def cmd_quote(message: Message) -> None:
     author = _get_author(reply)
     if author_user_id is None:
         log.warning("Cannot get quote author's user_id (username=%r, author_user_id=%d), bg will be black", author, author_user_id)
+        log.warning(message)
         status_warning = '(чёрный фон)'
 
     # Отправляем статусное сообщение
