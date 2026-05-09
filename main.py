@@ -1401,6 +1401,11 @@ def _get_author(msg: Message) -> str:
     return "Аноним"
 
 
+@router.message(Command("эхо"))
+async def cmd_echo(message: Message) -> None:
+    await message.answer(text=f"{message.text}")
+
+
 @router.message(
     Command("цитата"),
     F.chat.type.in_({"supergroup", "group"}),
