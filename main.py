@@ -566,7 +566,7 @@ def _get_message_link(chat_id: int, message_id: int) -> str:
         return f"https://t.me/c/{chat_id}/{message_id}"
 
 
-def _create_quote_keyboard(chat_id: int, message_id: int) -> InlineKeyboardMarkup:
+def _create_go_to_reply_message_keyboard(chat_id: int, message_id: int) -> InlineKeyboardMarkup:
     """Создаёт клавиатуру с кнопкой-ссылкой на оригинальное сообщение."""
     link = _get_message_link(chat_id, message_id)
     button = InlineKeyboardButton(text="💬 К сообщению", url=link)
@@ -1650,7 +1650,10 @@ async def cmd_voice_transcribe(message: Message) -> None:
             user_id=user_id,
             log_prefix="Manual",
         )
-        await status_msg.edit_text(text)
+        await status_msg.edit_text(
+            text,
+            reply_markup=_create_go_to_reply_message_keyboard(message.chat.id, reply.message_id),
+        )
     except Exception as exc:
         log.error("Media transcription failed: %s", exc, exc_info=True)
         await status_msg.edit_text("❌ Не удалось расшифровать сообщение.")
@@ -1687,7 +1690,10 @@ async def auto_voice_transcribe(message: Message) -> None:
             user_id=user_id,
             log_prefix="Auto",
         )
-        await message.reply(text)
+        await message.reply(
+            text,
+            reply_markup=_create_go_to_reply_message_keyboard(message.chat.id, message.message_id),
+        )
     except Exception as exc:
         log.error("Auto media transcription failed: %s", exc, exc_info=True)
         await message.reply("❌ Не удалось расшифровать сообщение.")
@@ -1776,7 +1782,7 @@ async def cmd_quote(message: Message) -> None:
     thread_id = SUPERCHAT_TO_THREAD_MAP.get(message.chat.id, QUOTE_THREAD_ID)
 
     # Создаём клавиатуру с ссылкой на оригинальное сообщение
-    keyboard = _create_quote_keyboard(message.chat.id, reply.message_id)
+    keyboard = _create_go_to_reply_message_keyboard(message.chat.id, reply.message_id)
 
     try:
         photo = FSInputFile(img_path)
