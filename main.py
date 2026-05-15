@@ -112,6 +112,7 @@ MIN_FONT_SIZE = 28
 MAX_SEMAPHORE_COUNT = 4
 MAX_WORKERS = 4
 GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
+VOICE_AUTO_TRANSCRIBE_ENABLED = False
 
 IMAGE_GEN_SEMAPHORE = asyncio.Semaphore(MAX_SEMAPHORE_COUNT)
 IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="img_gen")
@@ -1409,19 +1410,27 @@ def _get_author(msg: Message) -> str:
     return "Аноним"
 
 
-async def _download_voice_to_temp(bot: Bot, message: Message) -> str:
-    voice = message.voice
-    if voice is None:
-        raise ValueError("message does not contain voice")
+def _get_transcribable_media(message: Message):
+    if message.voice:
+        return message.voice, ".ogg", "voice"
+    if message.video_note:
+        return message.video_note, ".mp4", "video_note"
+    return None, "", ""
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+
+async def _download_transcribable_media_to_temp(bot: Bot, message: Message) -> tuple[str, str]:
+    media, suffix, media_type = _get_transcribable_media(message)
+    if media is None:
+        raise ValueError("message does not contain voice or video note")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     tmp_path = tmp.name
     tmp.close()
 
     try:
-        file = await bot.get_file(voice.file_id)
+        file = await bot.get_file(media.file_id)
         if file.file_path is None:
-            raise RuntimeError("Telegram returned empty file_path for voice")
+            raise RuntimeError(f"Telegram returned empty file_path for {media_type}")
         await bot.download_file(file.file_path, destination=tmp_path)
     except Exception:
         try:
@@ -1430,7 +1439,7 @@ async def _download_voice_to_temp(bot: Bot, message: Message) -> str:
             pass
         raise
 
-    return tmp_path
+    return tmp_path, media_type
 
 
 async def _transcribe_voice(path: str) -> str:
@@ -1451,19 +1460,77 @@ async def _transcribe_voice(path: str) -> str:
     return text
 
 
-async def _check_voice_transcription_service() -> tuple[bool, str]:
+async def _transcribe_message_media(
+    bot: Bot,
+    source_message: Message,
+    *,
+    chat_id: int,
+    user_id: int | None,
+    log_prefix: str,
+) -> str:
+    media, _, media_type = _get_transcribable_media(source_message)
+    if media is None:
+        raise ValueError("message does not contain voice or video note")
+
+    media_path: str | None = None
+
+    try:
+        log.info(
+            "%s downloading transcribable media type=%s file_id=%s duration=%s file_size=%s",
+            log_prefix,
+            media_type,
+            media.file_id,
+            getattr(media, "duration", None),
+            getattr(media, "file_size", None),
+        )
+        media_path, media_type = await _download_transcribable_media_to_temp(bot, source_message)
+        log.info("%s transcribable media downloaded to temp file: %s type=%s", log_prefix, media_path, media_type)
+
+        text = await _transcribe_voice(media_path)
+        log.info(
+            "%s media transcription completed chat_id=%s user_id=%s media_type=%s text_len=%d",
+            log_prefix,
+            chat_id,
+            user_id,
+            media_type,
+            len(text),
+        )
+        return text
+    finally:
+        if media_path:
+            try:
+                os.unlink(media_path)
+                log.info("%s transcribable media temp file deleted: %s", log_prefix, media_path)
+            except OSError as exc:
+                log.warning("%s failed to delete transcribable media temp file %s: %s", log_prefix, media_path, exc)
+
+
+async def _check_voice_transcription_service() -> tuple[bool, str, dict[str, str]]:
     if not GROQ_API_KEY:
         log.warning("Voice transcription service check failed: GROQ_API_KEY is not set")
-        return False, "GROQ_API_KEY is not set"
+        return False, "GROQ_API_KEY is not set", {}
 
     try:
         client = AsyncGroq(api_key=GROQ_API_KEY)
-        await client.models.retrieve(GROQ_WHISPER_MODEL)
-        log.info("Voice transcription service is available, model=%s", GROQ_WHISPER_MODEL)
-        return True, ""
+        response = await client.models.with_raw_response.retrieve(GROQ_WHISPER_MODEL)
+        rate_limits = {
+            "limit_requests": response.headers.get("x-ratelimit-limit-requests", ""),
+            "remaining_requests": response.headers.get("x-ratelimit-remaining-requests", ""),
+            "reset_requests": response.headers.get("x-ratelimit-reset-requests", ""),
+            "limit_tokens": response.headers.get("x-ratelimit-limit-tokens", ""),
+            "remaining_tokens": response.headers.get("x-ratelimit-remaining-tokens", ""),
+            "reset_tokens": response.headers.get("x-ratelimit-reset-tokens", ""),
+        }
+        response.parse()
+        log.info(
+            "Voice transcription service is available, model=%s, rate_limits=%s",
+            GROQ_WHISPER_MODEL,
+            rate_limits,
+        )
+        return True, "", rate_limits
     except Exception as exc:
         log.error("Voice transcription service check failed: %s", exc, exc_info=True)
-        return False, str(exc)
+        return False, str(exc), {}
 
 
 @router.message(Command("эхо"))
@@ -1479,14 +1546,72 @@ async def cmd_voice_check(message: Message) -> None:
         message.from_user.id if message.from_user else None,
     )
 
-    is_available, _ = await _check_voice_transcription_service()
+    is_available, error, rate_limits = await _check_voice_transcription_service()
+    auto_status = "включён" if VOICE_AUTO_TRANSCRIBE_ENABLED else "выключен"
+    limits_text = ""
+    if rate_limits:
+        requests_remaining = rate_limits.get("remaining_requests") or "неизвестно"
+        requests_limit = rate_limits.get("limit_requests") or "неизвестно"
+        requests_reset = rate_limits.get("reset_requests") or "неизвестно"
+        tokens_remaining = rate_limits.get("remaining_tokens") or "неизвестно"
+        tokens_limit = rate_limits.get("limit_tokens") or "неизвестно"
+        tokens_reset = rate_limits.get("reset_tokens") or "неизвестно"
+        limits_text = (
+            "\n\n📊 Лимиты Groq:"
+            f"\nЗапросы: {requests_remaining} / {requests_limit}"
+            f"\nСброс запросов через: {requests_reset}"
+            f"\nТокены: {tokens_remaining} / {tokens_limit}"
+            f"\nСброс токенов через: {tokens_reset}"
+        )
+
     if is_available:
-        await message.reply("✅ Сервис для перевода голосовых доступен.")
+        await message.reply(
+            "✅ Сервис для перевода голосовых доступен.\n"
+            f"Автотранскрибинг: {auto_status}."
+            f"{limits_text}"
+        )
     else:
-        await message.reply("❌ Сервис для перевода голосовых недоступен.")
+        error_text = f"\nОшибка: {error}" if error else ""
+        await message.reply(
+            "❌ Сервис для перевода голосовых недоступен.\n"
+            f"Автотранскрибинг: {auto_status}."
+            f"{error_text}"
+        )
 
 
-@router.message(Command("гс"))
+@router.message(Command("гсавто"))
+async def cmd_voice_auto(message: Message) -> None:
+    global VOICE_AUTO_TRANSCRIBE_ENABLED
+
+    args = (message.text or "").split(maxsplit=1)
+    user_id = message.from_user.id if message.from_user else None
+
+    log.info(
+        "Voice auto transcription toggle requested chat_id=%s user_id=%s text=%r",
+        message.chat.id,
+        user_id,
+        message.text,
+    )
+
+    if len(args) != 2 or args[1].strip() not in {"0", "1"}:
+        auto_status = "включён" if VOICE_AUTO_TRANSCRIBE_ENABLED else "выключен"
+        await message.reply(
+            "Использование: /гсавто <0 или 1>\n"
+            f"Сейчас автотранскрибинг: {auto_status}."
+        )
+        return
+
+    VOICE_AUTO_TRANSCRIBE_ENABLED = args[1].strip() == "1"
+    auto_status = "включён" if VOICE_AUTO_TRANSCRIBE_ENABLED else "выключен"
+    log.info("Voice auto transcription set to %s by user_id=%s", VOICE_AUTO_TRANSCRIBE_ENABLED, user_id)
+    await message.reply(f"Автотранскрибинг {auto_status}.")
+
+
+@router.message(
+    Command("гс"),
+    F.chat.type.in_({"supergroup", "group"}),
+    F.message_thread_id == None,
+)
 async def cmd_voice_transcribe(message: Message) -> None:
     reply = message.reply_to_message
     user_id = message.from_user.id if message.from_user else None
@@ -1498,43 +1623,63 @@ async def cmd_voice_transcribe(message: Message) -> None:
         reply.message_id if reply else None,
     )
 
-    if not reply or not reply.voice:
-        log.info("Voice transcription rejected: command is not a reply to voice message")
-        await message.reply("↩️ Ответьте командой /гс на голосовое сообщение.")
+    media, _, _ = _get_transcribable_media(reply) if reply else (None, "", "")
+    if not reply or media is None:
+        log.info("Voice transcription rejected: command is not a reply to voice or video note message")
+        await message.reply("↩️ Ответьте командой /гс на голосовое сообщение или кружочек.")
         return
 
-    status_msg = await message.answer("⏳ Расшифровываю голосовое сообщение...")
-    voice_path: str | None = None
+    status_msg = await message.answer("⏳ Расшифровываю сообщение...")
 
     try:
-        log.info(
-            "Downloading voice file_id=%s duration=%s file_size=%s",
-            reply.voice.file_id,
-            reply.voice.duration,
-            reply.voice.file_size,
+        text = await _transcribe_message_media(
+            message.bot,
+            reply,
+            chat_id=message.chat.id,
+            user_id=user_id,
+            log_prefix="Manual",
         )
-        voice_path = await _download_voice_to_temp(message.bot, reply)
-        log.info("Voice downloaded to temp file: %s", voice_path)
-
-        text = await _transcribe_voice(voice_path)
-        log.info(
-            "Voice transcription completed chat_id=%s user_id=%s text_len=%d",
-            message.chat.id,
-            user_id,
-            len(text),
-        )
-
         await status_msg.edit_text(text)
     except Exception as exc:
-        log.error("Voice transcription failed: %s", exc, exc_info=True)
-        await status_msg.edit_text("❌ Не удалось расшифровать голосовое сообщение.")
-    finally:
-        if voice_path:
-            try:
-                os.unlink(voice_path)
-                log.info("Voice temp file deleted: %s", voice_path)
-            except OSError as exc:
-                log.warning("Failed to delete voice temp file %s: %s", voice_path, exc)
+        log.error("Media transcription failed: %s", exc, exc_info=True)
+        await status_msg.edit_text("❌ Не удалось расшифровать сообщение.")
+
+
+@router.message(
+    F.chat.type.in_({"supergroup", "group"}),
+    F.message_thread_id == None,
+    F.voice | F.video_note,
+)
+async def auto_voice_transcribe(message: Message) -> None:
+    if not VOICE_AUTO_TRANSCRIBE_ENABLED:
+        return
+
+    media, _, media_type = _get_transcribable_media(message)
+    if media is None:
+        return
+
+    user_id = message.from_user.id if message.from_user else None
+
+    log.info(
+        "Auto media transcription requested chat_id=%s user_id=%s message_id=%s media_type=%s",
+        message.chat.id,
+        user_id,
+        message.message_id,
+        media_type,
+    )
+
+    try:
+        text = await _transcribe_message_media(
+            message.bot,
+            message,
+            chat_id=message.chat.id,
+            user_id=user_id,
+            log_prefix="Auto",
+        )
+        await message.reply(text)
+    except Exception as exc:
+        log.error("Auto media transcription failed: %s", exc, exc_info=True)
+        await message.reply("❌ Не удалось расшифровать сообщение.")
 
 
 @router.message(
