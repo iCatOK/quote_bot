@@ -34,6 +34,7 @@ from aiogram.types import (
     Message,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from groq import AsyncGroq
 
 
 # ─────────────────────────── config ───────────────────────────
@@ -56,6 +57,7 @@ WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Полный URL для webhook
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 BOT_MODE = os.environ.get("BOT_MODE", "webhook")  # "webhook" или "polling"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 # Supabase config
 SUPABASE_URL: str = os.environ["SUPABASE_URL"]
@@ -109,6 +111,7 @@ MIN_FONT_SIZE = 28
 
 MAX_SEMAPHORE_COUNT = 4
 MAX_WORKERS = 4
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 
 IMAGE_GEN_SEMAPHORE = asyncio.Semaphore(MAX_SEMAPHORE_COUNT)
 IMAGE_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="img_gen")
@@ -1406,9 +1409,132 @@ def _get_author(msg: Message) -> str:
     return "Аноним"
 
 
+async def _download_voice_to_temp(bot: Bot, message: Message) -> str:
+    voice = message.voice
+    if voice is None:
+        raise ValueError("message does not contain voice")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+
+    try:
+        file = await bot.get_file(voice.file_id)
+        if file.file_path is None:
+            raise RuntimeError("Telegram returned empty file_path for voice")
+        await bot.download_file(file.file_path, destination=tmp_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    return tmp_path
+
+
+async def _transcribe_voice(path: str) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not set")
+
+    client = AsyncGroq(api_key=GROQ_API_KEY)
+    transcription = await client.audio.transcriptions.create(
+        model=GROQ_WHISPER_MODEL,
+        file=Path(path),
+        response_format="json",
+        temperature=0,
+    )
+
+    text = (getattr(transcription, "text", "") or "").strip()
+    if not text:
+        raise RuntimeError("Groq returned empty transcription")
+    return text
+
+
+async def _check_voice_transcription_service() -> tuple[bool, str]:
+    if not GROQ_API_KEY:
+        log.warning("Voice transcription service check failed: GROQ_API_KEY is not set")
+        return False, "GROQ_API_KEY is not set"
+
+    try:
+        client = AsyncGroq(api_key=GROQ_API_KEY)
+        await client.models.retrieve(GROQ_WHISPER_MODEL)
+        log.info("Voice transcription service is available, model=%s", GROQ_WHISPER_MODEL)
+        return True, ""
+    except Exception as exc:
+        log.error("Voice transcription service check failed: %s", exc, exc_info=True)
+        return False, str(exc)
+
+
 @router.message(Command("эхо"))
 async def cmd_echo(message: Message) -> None:
     await message.answer(text=f"{message.text}")
+
+
+@router.message(Command("гсчек"))
+async def cmd_voice_check(message: Message) -> None:
+    log.info(
+        "Voice transcription API check requested chat_id=%s user_id=%s",
+        message.chat.id,
+        message.from_user.id if message.from_user else None,
+    )
+
+    is_available, _ = await _check_voice_transcription_service()
+    if is_available:
+        await message.reply("✅ Сервис для перевода голосовых доступен.")
+    else:
+        await message.reply("❌ Сервис для перевода голосовых недоступен.")
+
+
+@router.message(Command("гс"))
+async def cmd_voice_transcribe(message: Message) -> None:
+    reply = message.reply_to_message
+    user_id = message.from_user.id if message.from_user else None
+
+    log.info(
+        "Voice transcription requested chat_id=%s user_id=%s reply_message_id=%s",
+        message.chat.id,
+        user_id,
+        reply.message_id if reply else None,
+    )
+
+    if not reply or not reply.voice:
+        log.info("Voice transcription rejected: command is not a reply to voice message")
+        await message.reply("↩️ Ответьте командой /гс на голосовое сообщение.")
+        return
+
+    status_msg = await message.answer("⏳ Расшифровываю голосовое сообщение...")
+    voice_path: str | None = None
+
+    try:
+        log.info(
+            "Downloading voice file_id=%s duration=%s file_size=%s",
+            reply.voice.file_id,
+            reply.voice.duration,
+            reply.voice.file_size,
+        )
+        voice_path = await _download_voice_to_temp(message.bot, reply)
+        log.info("Voice downloaded to temp file: %s", voice_path)
+
+        text = await _transcribe_voice(voice_path)
+        log.info(
+            "Voice transcription completed chat_id=%s user_id=%s text_len=%d",
+            message.chat.id,
+            user_id,
+            len(text),
+        )
+
+        await status_msg.edit_text(text)
+    except Exception as exc:
+        log.error("Voice transcription failed: %s", exc, exc_info=True)
+        await status_msg.edit_text("❌ Не удалось расшифровать голосовое сообщение.")
+    finally:
+        if voice_path:
+            try:
+                os.unlink(voice_path)
+                log.info("Voice temp file deleted: %s", voice_path)
+            except OSError as exc:
+                log.warning("Failed to delete voice temp file %s: %s", voice_path, exc)
 
 
 @router.message(
