@@ -1521,7 +1521,7 @@ async def _check_voice_transcription_service() -> tuple[bool, str, dict[str, str
             "remaining_tokens": response.headers.get("x-ratelimit-remaining-tokens", ""),
             "reset_tokens": response.headers.get("x-ratelimit-reset-tokens", ""),
         }
-        response.parse()
+        await response.parse()
         log.info(
             "Voice transcription service is available, model=%s, rate_limits=%s",
             GROQ_WHISPER_MODEL,
