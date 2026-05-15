@@ -1505,6 +1505,19 @@ async def _transcribe_message_media(
                 log.warning("%s failed to delete transcribable media temp file %s: %s", log_prefix, media_path, exc)
 
 
+def _build_silent_wav_bytes(duration_seconds: float = 1.0, sample_rate: int = 16000) -> bytes:
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * int(sample_rate * duration_seconds))
+    return buffer.getvalue()
+
+
 async def _check_voice_transcription_service() -> tuple[bool, str, dict[str, str]]:
     if not GROQ_API_KEY:
         log.warning("Voice transcription service check failed: GROQ_API_KEY is not set")
@@ -1512,7 +1525,13 @@ async def _check_voice_transcription_service() -> tuple[bool, str, dict[str, str
 
     try:
         client = AsyncGroq(api_key=GROQ_API_KEY)
-        response = await client.models.with_raw_response.retrieve(GROQ_WHISPER_MODEL)
+        silent_wav = _build_silent_wav_bytes()
+        response = await client.audio.transcriptions.with_raw_response.create(
+            model=GROQ_WHISPER_MODEL,
+            file=("silence.wav", silent_wav, "audio/wav"),
+            response_format="json",
+            temperature=0,
+        )
         rate_limits = {
             "limit_requests": response.headers.get("x-ratelimit-limit-requests", ""),
             "remaining_requests": response.headers.get("x-ratelimit-remaining-requests", ""),
