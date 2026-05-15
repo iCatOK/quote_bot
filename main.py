@@ -1536,9 +1536,6 @@ async def _check_voice_transcription_service() -> tuple[bool, str, dict[str, str
             "limit_requests": response.headers.get("x-ratelimit-limit-requests", ""),
             "remaining_requests": response.headers.get("x-ratelimit-remaining-requests", ""),
             "reset_requests": response.headers.get("x-ratelimit-reset-requests", ""),
-            "limit_tokens": response.headers.get("x-ratelimit-limit-tokens", ""),
-            "remaining_tokens": response.headers.get("x-ratelimit-remaining-tokens", ""),
-            "reset_tokens": response.headers.get("x-ratelimit-reset-tokens", ""),
         }
         await response.parse()
         log.info(
@@ -1572,15 +1569,10 @@ async def cmd_voice_check(message: Message) -> None:
         requests_remaining = rate_limits.get("remaining_requests") or "неизвестно"
         requests_limit = rate_limits.get("limit_requests") or "неизвестно"
         requests_reset = rate_limits.get("reset_requests") or "неизвестно"
-        tokens_remaining = rate_limits.get("remaining_tokens") or "неизвестно"
-        tokens_limit = rate_limits.get("limit_tokens") or "неизвестно"
-        tokens_reset = rate_limits.get("reset_tokens") or "неизвестно"
         limits_text = (
             "\n\n📊 Лимиты Groq:"
             f"\nЗапросы: {requests_remaining} / {requests_limit}"
             f"\nСброс запросов через: {requests_reset}"
-            f"\nТокены: {tokens_remaining} / {tokens_limit}"
-            f"\nСброс токенов через: {tokens_reset}"
         )
 
     if is_available:
