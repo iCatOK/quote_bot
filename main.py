@@ -1665,6 +1665,8 @@ async def cmd_voice_transcribe(message: Message) -> None:
     F.voice | F.video_note,
 )
 async def auto_voice_transcribe(message: Message) -> None:
+    log.info("auto_voice_transcribe HIT chat=%s msg=%s", message.chat.id, message.message_id)
+    
     if not VOICE_AUTO_TRANSCRIBE_ENABLED:
         return
 
