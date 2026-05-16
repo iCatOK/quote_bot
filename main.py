@@ -24,6 +24,9 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -1944,11 +1947,38 @@ async def cmd_quote_wrong_thread(message: Message) -> None:
 
 # ─────────────────────────── lifecycle ────────────────────────
 
+GROUP_COMMANDS: list[BotCommand] = [
+    BotCommand(command="цитата", description="Сделать картинку-цитату из сообщения (ответом на него)"),
+    BotCommand(command="гс", description="Расшифровать голосовое сообщение (ответом на него)"),
+    BotCommand(command="гсавто", description="Включить/выключить авто-расшифровку голосовых"),
+    BotCommand(command="саммари", description="Краткое содержание последних сообщений чата"),
+    BotCommand(command="инфо", description="Информация о боте и статусе"),
+    BotCommand(command="эхо", description="Повторить ваше сообщение"),
+]
+
+PRIVATE_COMMANDS: list[BotCommand] = [
+    BotCommand(command="инфо", description="Информация о боте и статусе"),
+    BotCommand(command="эхо", description="Повторить ваше сообщение"),
+]
+
+
+async def _setup_bot_commands(bot: Bot) -> None:
+    """Register command menus shown in Telegram's '/' picker."""
+    try:
+        await bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
+        await bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+        log.info("Bot commands registered: %d group, %d private",
+                 len(GROUP_COMMANDS), len(PRIVATE_COMMANDS))
+    except Exception as e:
+        log.warning("Failed to set bot commands: %s", e)
+
+
 async def on_startup(bot: Bot) -> None:
     me = await bot.get_me()
     log.info("Bot started: @%s (id=%d)", me.username, me.id)
     log.info("Initial RSS: %.1f MB", _get_rss_mb())
     log.info("supports_inline_queries=%s", getattr(me, "supports_inline_queries", None))
+    await _setup_bot_commands(bot)
 
 
 async def on_startup_webhook(bot: Bot) -> None:
@@ -1957,7 +1987,9 @@ async def on_startup_webhook(bot: Bot) -> None:
     log.info("Bot starting (webhook): @%s (id=%d)", me.username, me.id)
     log.info("Initial RSS: %.1f MB", _get_rss_mb())
     log.info("supports_inline_queries=%s", getattr(me, "supports_inline_queries", None))
-    
+
+    await _setup_bot_commands(bot)
+
     if WEBHOOK_URL:
         await bot.set_webhook(
             url=WEBHOOK_URL,
