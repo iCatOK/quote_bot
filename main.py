@@ -36,6 +36,11 @@ from aiogram.types import (
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from groq import AsyncGroq
 
+from summary import (
+    MessageHistoryMiddleware,
+    router as summary_router,
+)
+
 
 # ─────────────────────────── config ───────────────────────────
 
@@ -2012,6 +2017,12 @@ def init_bot() -> tuple[Bot, Dispatcher]:
     """Инициализация бота и диспетчера"""
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
+    # Outer middleware сохраняет каждое сообщение из групп в историю
+    # для последующей суммаризации командой /саммари.
+    dp.message.outer_middleware(MessageHistoryMiddleware())
+    # Роутер с командой /саммари должен быть зарегистрирован раньше
+    # основного router'а, чтобы команда не перехватывалась общими фильтрами.
+    dp.include_router(summary_router)
     dp.include_router(router)
     return bot, dp
 

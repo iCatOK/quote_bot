@@ -6,3 +6,4 @@ python-dotenv>=1.0
 aiofiles
 supabase==2.30.0
 groq>=0.31.0
+cerebras_cloud_sdk>=1.30.0
