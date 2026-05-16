@@ -123,6 +123,68 @@ def _extract_text(message: Message) -> Optional[str]:
     return text
 
 
+def _estimate_tokens(text: str) -> int:
+    """Грубая оценка числа токенов.
+
+    Точный токенизатор Qwen-3 в пакете не поставляется, поэтому используем
+    эвристику: для смеси русского и латиницы в BPE-токенизаторах в среднем
+    выходит ~3 символа на токен. Этого достаточно для индикатора в /инфо.
+    """
+    return max(1, len(text) // 3) if text else 0
+
+
+def _format_relative_delta(delta: timedelta) -> str:
+    total_seconds = int(delta.total_seconds())
+    if total_seconds < 60:
+        return "только что"
+    minutes = total_seconds // 60
+    if minutes < 60:
+        return f"{minutes} мин назад"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} ч назад"
+    days = hours // 24
+    return f"{days} дн назад"
+
+
+def format_chat_summary_info(chat_id: int) -> str:
+    """Краткая сводка о состоянии буфера саммаризации в чате.
+
+    Используется командой `/инфо` для диагностики.
+    """
+    history = _histories.get(chat_id)
+    if history is None or not history.messages:
+        messages_count = 0
+        tokens_estimate = 0
+    else:
+        messages_count = len(history.messages)
+        # Считаем тот же текст, который реально полетит в LLM (system + user).
+        slice_for_llm = history.messages
+        if messages_count > SUMMARY_MAX_MESSAGES_PER_REQUEST:
+            slice_for_llm = slice_for_llm[-SUMMARY_MAX_MESSAGES_PER_REQUEST:]
+        user_prompt = (
+            "Переписка чата (формат `[UTC время] Имя: текст`):\n\n"
+            + _format_messages(slice_for_llm)
+        )
+        tokens_estimate = _estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(user_prompt)
+
+    last_at = history.last_summary_at if history else None
+    if last_at is None:
+        last_line = "никогда"
+    else:
+        now = datetime.now(timezone.utc)
+        delta = now - last_at.astimezone(timezone.utc)
+        absolute = last_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        last_line = f"{absolute} ({_format_relative_delta(delta)})"
+
+    return (
+        "🧾 Саммаризация:"
+        f"\nСообщений в буфере: {messages_count}"
+        f"\nПримерно токенов в промпте: ~{tokens_estimate}"
+        f"\nПоследний вызов /саммари: {last_line}"
+    )
+
+
 def _format_messages(messages: list[StoredMessage]) -> str:
     lines: list[str] = []
     for m in messages:

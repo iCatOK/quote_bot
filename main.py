@@ -38,6 +38,7 @@ from groq import AsyncGroq
 
 from summary import (
     MessageHistoryMiddleware,
+    format_chat_summary_info,
     router as summary_router,
 )
 
@@ -1559,10 +1560,10 @@ async def cmd_echo(message: Message) -> None:
     await message.answer(text=f"{message.text}")
 
 
-@router.message(Command("гсчек"))
-async def cmd_voice_check(message: Message) -> None:
+@router.message(Command("инфо"))
+async def cmd_bot_info(message: Message) -> None:
     log.info(
-        "Voice transcription API check requested chat_id=%s user_id=%s",
+        "Bot info requested chat_id=%s user_id=%s",
         message.chat.id,
         message.from_user.id if message.from_user else None,
     )
@@ -1580,11 +1581,14 @@ async def cmd_voice_check(message: Message) -> None:
             f"\nСброс запросов через: {requests_reset}"
         )
 
+    summary_info = format_chat_summary_info(message.chat.id)
+
     if is_available:
         await message.reply(
             "✅ Сервис для перевода голосовых доступен.\n"
             f"Автотранскрибинг: {auto_status}."
             f"{limits_text}"
+            f"\n\n{summary_info}"
         )
     else:
         error_text = f"\nОшибка: {error}" if error else ""
@@ -1592,6 +1596,7 @@ async def cmd_voice_check(message: Message) -> None:
             "❌ Сервис для перевода голосовых недоступен.\n"
             f"Автотранскрибинг: {auto_status}."
             f"{error_text}"
+            f"\n\n{summary_info}"
         )
 
 
