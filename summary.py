@@ -1,4 +1,4 @@
-"""Daily-style chat summarisation feature backed by Cerebras LLM."""
+"""Daily-style chat summarisation feature backed by AIHubMix LLM."""
 from __future__ import annotations
 
 import asyncio
@@ -14,17 +14,20 @@ from aiogram.filters import Command
 from aiogram.types import Message, TelegramObject
 
 try:
-    from cerebras.cloud.sdk import AsyncCerebras
+    from openai import AsyncOpenAI
 except ImportError:  # pragma: no cover - optional dep at import time
-    AsyncCerebras = None  # type: ignore[assignment]
+    AsyncOpenAI = None  # type: ignore[assignment]
 
 
 log = logging.getLogger("quote_bot.summary")
 
-CEREBRAS_API_KEY = os.environ.get("CEREBRAS_API_KEY")
-CEREBRAS_MODEL = os.environ.get(
-    "CEREBRAS_MODEL", "qwen-3-235b-a22b-instruct-2507"
+# AIHubMix — OpenAI-совместимый агрегатор. Используем стандартный SDK openai,
+# указывая ему base_url AIHubMix.
+AI_HUB_MIX_API_KEY = os.environ.get("AI_HUB_MIX_API_KEY")
+AI_HUB_MIX_BASE_URL = os.environ.get(
+    "AI_HUB_MIX_BASE_URL", "https://aihubmix.com/v1"
 )
+AI_HUB_MIX_MODEL = os.environ.get("AI_HUB_MIX_MODEL", "gpt-5.5-free")
 
 # Если новое сообщение приходит позже, чем `SUMMARY_AUTO_TRIGGER_DELTA`
 # после последнего вызова /summary — автоматически суммаризируем буфер,
@@ -229,10 +232,10 @@ def _format_messages(messages: list[StoredMessage]) -> str:
 
 
 async def _generate_summary(messages: list[StoredMessage]) -> str:
-    if AsyncCerebras is None:
-        raise RuntimeError("cerebras_cloud_sdk is not installed")
-    if not CEREBRAS_API_KEY:
-        raise RuntimeError("CEREBRAS_API_KEY is not set")
+    if AsyncOpenAI is None:
+        raise RuntimeError("openai package is not installed")
+    if not AI_HUB_MIX_API_KEY:
+        raise RuntimeError("AI_HUB_MIX_API_KEY is not set")
 
     # При очень длинной истории берём последние N — приоритет свежему контексту.
     if len(messages) > SUMMARY_MAX_MESSAGES_PER_REQUEST:
@@ -245,20 +248,26 @@ async def _generate_summary(messages: list[StoredMessage]) -> str:
         + _format_messages(messages)
     )
 
-    async with AsyncCerebras(api_key=CEREBRAS_API_KEY) as client:
+    client = AsyncOpenAI(
+        api_key=AI_HUB_MIX_API_KEY,
+        base_url=AI_HUB_MIX_BASE_URL,
+    )
+    try:
         completion = await client.chat.completions.create(
-            model=CEREBRAS_MODEL,
+            model=AI_HUB_MIX_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.7,
         )
+    finally:
+        await client.close()
 
     choice = completion.choices[0]
     text = (getattr(choice.message, "content", "") or "").strip()
     if not text:
-        raise RuntimeError("Cerebras returned empty completion")
+        raise RuntimeError("AIHubMix returned empty completion")
     return text
 
 
@@ -488,13 +497,13 @@ async def cmd_summary(message: Message) -> None:
         "Summary requested chat_id=%s user_id=%s", chat_id, user_id
     )
 
-    if AsyncCerebras is None:
+    if AsyncOpenAI is None:
         await message.reply(
-            "❌ Пакет `cerebras_cloud_sdk` не установлен на сервере."
+            "❌ Пакет `openai` не установлен на сервере."
         )
         return
-    if not CEREBRAS_API_KEY:
-        await message.reply("❌ `CEREBRAS_API_KEY` не настроен.")
+    if not AI_HUB_MIX_API_KEY:
+        await message.reply("❌ `AI_HUB_MIX_API_KEY` не настроен.")
         return
 
     history = _get_history(chat_id)
