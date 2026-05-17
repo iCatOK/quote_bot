@@ -42,6 +42,17 @@ SYSTEM_PROMPT = (
     "Скорее — наблюдательный приятель, который пролистал переписку и в двух "
     "словах рассказывает, что там было: с подколами, узнаваемыми деталями и "
     "лёгкой иронией. Ты пишешь по-русски, для своих.\n\n"
+    "Формат входных данных (то, что тебе пришлёт пользователь):\n"
+    "- Каждое сообщение в отдельной строке вида:\n"
+    "  `[HH:MM] #<msg_id> [↪#<reply_to>] [🎤] Имя: текст`\n"
+    "- `#123` — это id сообщения в чате.\n"
+    "- `↪#100` означает, что это ответ на сообщение с id 100. Используй эту связь, "
+    "чтобы понимать нить разговора (кто кому отвечает, как развивается обсуждение).\n"
+    "- Маркер `🎤` означает, что текст — это автоматическая расшифровка голосового "
+    "или видеосообщения. Возможны неточности распознавания (опечатки, странные "
+    "слова, неверные имена). Не цепляйся к буквальным формулировкам таких "
+    "сообщений: ориентируйся на общий смысл и помни, что человек говорил голосом, "
+    "а не печатал.\n\n"
     "Как писать:\n"
     "- Живой разговорный язык. Короткие фразы. Можно неполные предложения — "
     "как в обычной речи. Можно начать с «ну», «короче», «в общем», если по делу.\n"
@@ -62,16 +73,30 @@ SYSTEM_PROMPT = (
     "- Шаблонов вроде «в этот замечательный день», «команда обсудила», "
     "«подводя итог, можно сказать».\n"
     "- Длинных вводных и метакомментариев («сейчас я расскажу…»).\n"
-    "- Перечислений в стиле протокола собрания.\n\n"
+    "- Перечислений в стиле протокола собрания.\n"
+    "- Не вставляй в ответ id сообщений (`#123`) и стрелки (`↪`) — это служебная "
+    "разметка только для тебя.\n\n"
     "Структура ответа (соблюдай, но без занудства):\n"
-    "1. Заголовок: «📅 Ежедневное саммари».\n"
+    "1. Заголовок: *📅 Ежедневное саммари*.\n"
     "2. 3–5 тематических блоков. У каждого — короткий ироничный заголовок "
-    "(например, «📌 Перепалка из-за пельменей» или «🛠️ Очередной героический "
-    "деплой в пятницу»).\n"
+    "жирным (например, *📌 Перепалка из-за пельменей* или *🛠️ Очередной "
+    "героический деплой в пятницу*).\n"
     "3. В блоке — 1–3 живых предложения: о чём спорили/шутили/договорились, "
     "с именами и деталями. Решения помечай ✅, нерешённые вопросы — ❓.\n"
     "4. В конце — одна-две фразы про общее настроение чата. Без морали и "
-    "выводов «что мы из этого вынесли»."
+    "выводов «что мы из этого вынесли».\n\n"
+    "ФОРМАТИРОВАНИЕ — Telegram MarkdownV2 (обязательно соблюдай):\n"
+    "- Жирный: `*текст*` (одна звёздочка с каждой стороны). Используй для "
+    "заголовка и заголовков блоков.\n"
+    "- Курсив: `_текст_`.\n"
+    "- Моноширинный (для ников/команд/коротких цитат при желании): `` `текст` ``.\n"
+    "- В обычном тексте ОБЯЗАТЕЛЬНО экранируй обратной косой чертой следующие "
+    "символы: `_ * [ ] ( ) ~ \\` `>` `#` `+` `-` `=` `|` `{` `}` `.` `!`.\n"
+    "  Пример правильного экранирования: `Алиса сказала: всё ок\\. И ушла спать\\!`\n"
+    "  Пример со списком: `1\\. первое  2\\. второе`\n"
+    "- Внутри `*...*` и `_..._` правила экранирования те же.\n"
+    "- Никаких `**жирный**`, `##заголовков`, HTML-тегов — это не MarkdownV2.\n"
+    "- Эмодзи экранировать не нужно."
 )
 
 
@@ -81,6 +106,11 @@ class StoredMessage:
     full_name: str
     text: str
     date: datetime
+    message_id: Optional[int] = None
+    reply_to_message_id: Optional[int] = None
+    # True для расшифровок голосовых/видео — даёт LLM понять, что текст
+    # получен автоматически и может содержать неточности.
+    is_media: bool = False
 
 
 @dataclass
@@ -162,10 +192,7 @@ def format_chat_summary_info(chat_id: int) -> str:
         slice_for_llm = history.messages
         if messages_count > SUMMARY_MAX_MESSAGES_PER_REQUEST:
             slice_for_llm = slice_for_llm[-SUMMARY_MAX_MESSAGES_PER_REQUEST:]
-        user_prompt = (
-            "Переписка чата (формат `[UTC время] Имя: текст`):\n\n"
-            + _format_messages(slice_for_llm)
-        )
+        user_prompt = _format_messages(slice_for_llm)
         tokens_estimate = _estimate_tokens(SYSTEM_PROMPT) + _estimate_tokens(user_prompt)
 
     last_at = history.last_summary_at if history else None
@@ -188,8 +215,16 @@ def format_chat_summary_info(chat_id: int) -> str:
 def _format_messages(messages: list[StoredMessage]) -> str:
     lines: list[str] = []
     for m in messages:
-        ts = m.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"[{ts}] {m.full_name}: {m.text}")
+        ts = m.date.astimezone(timezone.utc).strftime("%H:%M")
+        parts: list[str] = [f"[{ts}]"]
+        if m.message_id is not None:
+            parts.append(f"#{m.message_id}")
+        if m.reply_to_message_id is not None:
+            parts.append(f"↪#{m.reply_to_message_id}")
+        if m.is_media:
+            parts.append("🎤")
+        prefix = " ".join(parts)
+        lines.append(f"{prefix} {m.full_name}: {m.text}")
     return "\n".join(lines)
 
 
@@ -204,7 +239,9 @@ async def _generate_summary(messages: list[StoredMessage]) -> str:
         messages = messages[-SUMMARY_MAX_MESSAGES_PER_REQUEST:]
 
     user_prompt = (
-        "Переписка чата (формат `[UTC время] Имя: текст`):\n\n"
+        "Переписка чата. Формат строки:\n"
+        "  `[HH:MM] #<msg_id> [↪#<reply_to>] [🎤] Имя: текст`\n"
+        "(`↪` — ответ на сообщение, `🎤` — расшифровка голосового/видео).\n\n"
         + _format_messages(messages)
     )
 
@@ -256,12 +293,16 @@ async def save_message_to_history(message: Message) -> None:
             history.messages = []
             history.last_summary_at = msg_date
 
+        reply_to = message.reply_to_message
         history.messages.append(
             StoredMessage(
                 user_id=message.from_user.id if message.from_user else None,
                 full_name=_author_name(message),
                 text=text,
                 date=msg_date,
+                message_id=message.message_id,
+                reply_to_message_id=reply_to.message_id if reply_to else None,
+                is_media=False,
             )
         )
         if len(history.messages) > HISTORY_MAX_MESSAGES:
@@ -270,6 +311,124 @@ async def save_message_to_history(message: Message) -> None:
     if auto_flush:
         asyncio.create_task(
             _send_auto_summary(message.bot, chat_id, auto_flush)
+        )
+
+
+async def save_transcribed_media(message: Message, transcribed_text: str) -> None:
+    """Сохранить в историю расшифровку голосового или видеосообщения.
+
+    `message` — оригинальное медиа-сообщение (его автор и id используются как
+    источник). `transcribed_text` — результат распознавания. Сообщение помечается
+    как `is_media=True`, чтобы LLM не воспринимало формулировки слишком буквально.
+    """
+    if message.chat.type not in {"group", "supergroup"}:
+        return
+    if message.from_user is None or message.from_user.is_bot:
+        return
+    text = (transcribed_text or "").strip()
+    if not text:
+        return
+
+    chat_id = message.chat.id
+    history = _get_history(chat_id)
+    msg_date = message.date or datetime.now(timezone.utc)
+    reply_to = message.reply_to_message
+
+    auto_flush: list[StoredMessage] | None = None
+    async with history.lock:
+        if (
+            history.last_summary_at is not None
+            and history.messages
+            and msg_date - history.last_summary_at > SUMMARY_AUTO_TRIGGER_DELTA
+        ):
+            auto_flush = history.messages
+            history.messages = []
+            history.last_summary_at = msg_date
+
+        history.messages.append(
+            StoredMessage(
+                user_id=message.from_user.id,
+                full_name=_author_name(message),
+                text=text,
+                date=msg_date,
+                message_id=message.message_id,
+                reply_to_message_id=reply_to.message_id if reply_to else None,
+                is_media=True,
+            )
+        )
+        if len(history.messages) > HISTORY_MAX_MESSAGES:
+            history.messages = history.messages[-HISTORY_MAX_MESSAGES:]
+
+    if auto_flush:
+        asyncio.create_task(
+            _send_auto_summary(message.bot, chat_id, auto_flush)
+        )
+
+
+_MARKDOWN_V2_SPECIAL_CHARS = r"_*[]()~`>#+-=|{}.!\\"
+
+
+def _strip_md_v2_escapes(text: str) -> str:
+    """Снимает экранирование MarkdownV2 для плейн-текстового fallback'а.
+
+    Когда Telegram отказывается парсить ответ LLM как MarkdownV2 (например,
+    модель оставила непарную `*`), нам нужно отправить текст без parse_mode.
+    Тогда литералы `\\.` или `\\!` смотрелись бы как мусор — этот хелпер их чистит.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in _MARKDOWN_V2_SPECIAL_CHARS:
+            out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+async def _send_summary_text(
+    bot,
+    chat_id: int,
+    text: str,
+    *,
+    edit_message=None,
+) -> None:
+    """Отправить готовый текст саммари с MarkdownV2; при ошибке — plain text.
+
+    `edit_message` — если задано, пытаемся `edit_text`, иначе `send_message`.
+    Длинные тексты, которые не лезут в edit, переотправляются новым сообщением.
+    """
+    async def _do(parse_mode: Optional[str], payload: str) -> None:
+        if edit_message is not None:
+            try:
+                await edit_message.edit_text(payload, parse_mode=parse_mode)
+                return
+            except Exception as exc:
+                log.warning(
+                    "Summary edit_text failed chat_id=%s parse_mode=%s: %s; "
+                    "fallback to send_message",
+                    chat_id, parse_mode, exc,
+                )
+        await bot.send_message(chat_id, payload, parse_mode=parse_mode)
+
+    try:
+        await _do("MarkdownV2", text)
+        return
+    except Exception as exc:
+        # Скорее всего LLM сгенерировала невалидный MarkdownV2.
+        log.warning(
+            "Summary MarkdownV2 send failed chat_id=%s: %s; fallback to plain text",
+            chat_id, exc,
+        )
+
+    plain = _strip_md_v2_escapes(text)
+    try:
+        await _do(None, plain)
+    except Exception as exc:
+        log.error(
+            "Summary plain-text send failed chat_id=%s: %s", chat_id, exc, exc_info=True
         )
 
 
@@ -289,12 +448,7 @@ async def _send_auto_summary(
             exc_info=True,
         )
         return
-    try:
-        await bot.send_message(chat_id, text)
-    except Exception as exc:
-        log.error(
-            "Auto summary send failed chat_id=%s: %s", chat_id, exc, exc_info=True
-        )
+    await _send_summary_text(bot, chat_id, text)
 
 
 # ─────────────────────────── middleware ──────────────────────────────────
@@ -376,13 +530,4 @@ async def cmd_summary(message: Message) -> None:
     async with history.lock:
         history.messages.clear()
 
-    try:
-        await status.edit_text(text)
-    except Exception as exc:
-        # Длинный текст или другие ограничения Telegram — отправим новым сообщением.
-        log.warning(
-            "Summary edit_text failed chat_id=%s, sending as new message: %s",
-            chat_id,
-            exc,
-        )
-        await message.answer(text)
+    await _send_summary_text(message.bot, chat_id, text, edit_message=status)

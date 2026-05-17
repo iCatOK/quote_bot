@@ -43,6 +43,7 @@ from summary import (
     MessageHistoryMiddleware,
     format_chat_summary_info,
     router as summary_router,
+    save_transcribed_media,
 )
 
 
@@ -1504,6 +1505,15 @@ async def _transcribe_message_media(
             media_type,
             len(text),
         )
+        # Сохраняем расшифровку в историю для саммаризации, помечая сообщение
+        # как медиа — чтобы LLM учитывал возможные неточности распознавания.
+        try:
+            await save_transcribed_media(source_message, text)
+        except Exception as exc:
+            log.warning(
+                "%s failed to save transcribed media to summary history: %s",
+                log_prefix, exc,
+            )
         return text
     finally:
         if media_path:
