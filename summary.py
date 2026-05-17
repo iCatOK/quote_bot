@@ -27,7 +27,7 @@ CEREBRAS_MODEL = os.environ.get(
 )
 
 # Если новое сообщение приходит позже, чем `SUMMARY_AUTO_TRIGGER_DELTA`
-# после последнего вызова /саммари — автоматически суммаризируем буфер,
+# после последнего вызова /summary — автоматически суммаризируем буфер,
 # чтобы он не рос бесконтрольно.
 SUMMARY_AUTO_TRIGGER_DELTA = timedelta(days=1)
 
@@ -128,7 +128,7 @@ def _estimate_tokens(text: str) -> int:
 
     Точный токенизатор Qwen-3 в пакете не поставляется, поэтому используем
     эвристику: для смеси русского и латиницы в BPE-токенизаторах в среднем
-    выходит ~3 символа на токен. Этого достаточно для индикатора в /инфо.
+    выходит ~3 символа на токен. Этого достаточно для индикатора в /info.
     """
     return max(1, len(text) // 3) if text else 0
 
@@ -150,7 +150,7 @@ def _format_relative_delta(delta: timedelta) -> str:
 def format_chat_summary_info(chat_id: int) -> str:
     """Краткая сводка о состоянии буфера саммаризации в чате.
 
-    Используется командой `/инфо` для диагностики.
+    Используется командой `/info` для диагностики.
     """
     history = _histories.get(chat_id)
     if history is None or not history.messages:
@@ -181,7 +181,7 @@ def format_chat_summary_info(chat_id: int) -> str:
         "🧾 Саммаризация:"
         f"\nСообщений в буфере: {messages_count}"
         f"\nПримерно токенов в промпте: ~{tokens_estimate}"
-        f"\nПоследний вызов /саммари: {last_line}"
+        f"\nПоследний вызов /summary: {last_line}"
     )
 
 
@@ -228,12 +228,12 @@ async def _generate_summary(messages: list[StoredMessage]) -> str:
 async def save_message_to_history(message: Message) -> None:
     """Сохранить сообщение в буфер истории чата.
 
-    Если с момента последнего вызова `/саммари` прошло больше суток —
+    Если с момента последнего вызова `/summary` прошло больше суток —
     выгружает накопленный буфер в фоновую задачу-суммаризатор и очищает его.
     """
     if message.chat.type not in {"group", "supergroup"}:
         return
-    # Игнорируем сообщения от ботов — они шумят в саммари
+    # Игнорируем сообщения от ботов — они шумят в summary
     # (статусы, ответы команд, авто-транскрибация и т.п.).
     if message.from_user is None or message.from_user.is_bot:
         return
@@ -324,7 +324,7 @@ router = Router(name="summary")
 
 
 @router.message(
-    Command("саммари"),
+    Command("summary"),
     F.chat.type.in_({"supergroup", "group"}),
 )
 async def cmd_summary(message: Message) -> None:

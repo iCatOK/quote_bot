@@ -1558,12 +1558,12 @@ async def _check_voice_transcription_service() -> tuple[bool, str, dict[str, str
         return False, str(exc), {}
 
 
-@router.message(Command("эхо"))
+@router.message(Command("echo"))
 async def cmd_echo(message: Message) -> None:
     await message.answer(text=f"{message.text}")
 
 
-@router.message(Command("инфо"))
+@router.message(Command("info"))
 async def cmd_bot_info(message: Message) -> None:
     log.info(
         "Bot info requested chat_id=%s user_id=%s",
@@ -1603,7 +1603,7 @@ async def cmd_bot_info(message: Message) -> None:
         )
 
 
-@router.message(Command("гсавто"))
+@router.message(Command("voiceauto"))
 async def cmd_voice_auto(message: Message) -> None:
     global VOICE_AUTO_TRANSCRIBE_ENABLED
 
@@ -1620,7 +1620,7 @@ async def cmd_voice_auto(message: Message) -> None:
     if len(args) != 2 or args[1].strip() not in {"0", "1"}:
         auto_status = "включён" if VOICE_AUTO_TRANSCRIBE_ENABLED else "выключен"
         await message.reply(
-            "Использование: /гсавто <0 или 1>\n"
+            "Использование: /voiceauto <0 или 1>\n"
             f"Сейчас автотранскрибинг: {auto_status}."
         )
         return
@@ -1632,7 +1632,7 @@ async def cmd_voice_auto(message: Message) -> None:
 
 
 @router.message(
-    Command("гс"),
+    Command("voice"),
     F.chat.type.in_({"supergroup", "group"}),
     F.message_thread_id == None,
 )
@@ -1650,7 +1650,7 @@ async def cmd_voice_transcribe(message: Message) -> None:
     media, _, _ = _get_transcribable_media(reply) if reply else (None, "", "")
     if not reply or media is None:
         log.info("Voice transcription rejected: command is not a reply to voice or video note message")
-        await message.reply("↩️ Ответьте командой /гс на голосовое сообщение или кружочек.")
+        await message.reply("↩️ Ответьте командой /voice на голосовое сообщение или кружочек.")
         return
 
     status_msg = await message.answer("⏳ Расшифровываю сообщение...")
@@ -1715,7 +1715,7 @@ async def auto_voice_transcribe(message: Message) -> None:
 
 
 @router.message(
-    Command("цитата"),
+    Command("quote"),
     F.chat.type.in_({"supergroup", "group"}),
     F.message_thread_id == None
 )
@@ -1723,7 +1723,7 @@ async def cmd_quote(message: Message) -> None:
     reply = message.reply_to_message
 
     if not reply:
-        await message.reply("↩️ Ответьте командой /цитата на сообщение с цитатой.")
+        await message.reply("↩️ Ответьте командой /quote на сообщение с цитатой.")
         return
 
     quote_text: str | None = reply.text or reply.caption
@@ -1936,10 +1936,10 @@ async def inline_pinterest_search(inline_query: InlineQuery) -> None:
     )
 
 
-@router.message(Command("цитата"))
+@router.message(Command("quote"))
 async def cmd_quote_wrong_thread(message: Message) -> None:
     log.debug(
-        "Ignored /цитата from chat=%s thread=%s",
+        "Ignored /quote from chat=%s thread=%s",
         message.chat.id,
         message.message_thread_id,
     )
@@ -1948,17 +1948,17 @@ async def cmd_quote_wrong_thread(message: Message) -> None:
 # ─────────────────────────── lifecycle ────────────────────────
 
 GROUP_COMMANDS: list[BotCommand] = [
-    BotCommand(command="цитата", description="Сделать картинку-цитату из сообщения (ответом на него)"),
-    BotCommand(command="гс", description="Расшифровать голосовое сообщение (ответом на него)"),
-    BotCommand(command="гсавто", description="Включить/выключить авто-расшифровку голосовых"),
-    BotCommand(command="саммари", description="Краткое содержание последних сообщений чата"),
-    BotCommand(command="инфо", description="Информация о боте и статусе"),
-    BotCommand(command="эхо", description="Повторить ваше сообщение"),
+    BotCommand(command="quote", description="Сделать картинку-цитату из сообщения (ответом на него)"),
+    BotCommand(command="voice", description="Расшифровать голосовое сообщение (ответом на него)"),
+    BotCommand(command="voiceauto", description="Включить/выключить авто-расшифровку голосовых"),
+    BotCommand(command="summary", description="Краткое содержание последних сообщений чата"),
+    BotCommand(command="info", description="Информация о боте и статусе"),
+    BotCommand(command="echo", description="Повторить ваше сообщение"),
 ]
 
 PRIVATE_COMMANDS: list[BotCommand] = [
-    BotCommand(command="инфо", description="Информация о боте и статусе"),
-    BotCommand(command="эхо", description="Повторить ваше сообщение"),
+    BotCommand(command="info", description="Информация о боте и статусе"),
+    BotCommand(command="echo", description="Повторить ваше сообщение"),
 ]
 
 
@@ -2055,9 +2055,9 @@ def init_bot() -> tuple[Bot, Dispatcher]:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     # Outer middleware сохраняет каждое сообщение из групп в историю
-    # для последующей суммаризации командой /саммари.
+    # для последующей суммаризации командой /summary.
     dp.message.outer_middleware(MessageHistoryMiddleware())
-    # Роутер с командой /саммари должен быть зарегистрирован раньше
+    # Роутер с командой /summary должен быть зарегистрирован раньше
     # основного router'а, чтобы команда не перехватывалась общими фильтрами.
     dp.include_router(summary_router)
     dp.include_router(router)
