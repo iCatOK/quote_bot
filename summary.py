@@ -18,6 +18,16 @@ try:
 except ImportError:  # pragma: no cover - optional dep at import time
     AsyncOpenAI = None  # type: ignore[assignment]
 
+import aiohttp
+
+# Laozhang API configuration for gpt-image-2
+LAOZHANG_API_KEY = os.getenv("LAOZHANG_API_KEY", "")
+LAOZHANG_API_URL = "https://api.laozhang.ai/v1"
+LAOZHANG_IMAGE_MODEL = "gpt-image-2"
+
+# Global setting for summary comics generation
+SUMMARY_COMICS_ENABLED = False
+
 
 log = logging.getLogger("quote_bot.summary")
 
@@ -207,11 +217,13 @@ def format_chat_summary_info(chat_id: int) -> str:
         absolute = last_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         last_line = f"{absolute} ({_format_relative_delta(delta)})"
 
+    comics_status = "включено" if SUMMARY_COMICS_ENABLED else "выключено"
     return (
         "🧾 Саммаризация:"
         f"\nСообщений в буфере: {messages_count}"
         f"\nПримерно токенов в промпте: ~{tokens_estimate}"
         f"\nПоследний вызов /summary: {last_line}"
+        f"\nГенерация комиксов: {comics_status}"
     )
 
 
@@ -397,6 +409,68 @@ def _strip_md_v2_escapes(text: str) -> str:
     return "".join(out)
 
 
+async def generate_summary_comics_image(text: str) -> Optional[bytes]:
+    """Generate a comic-style image from summary text using Laozhang gpt-image-2 API.
+    
+    Returns bytes of the generated image or None if generation fails.
+    Resolution: 2K, aspect ratio: auto.
+    """
+    global SUMMARY_COMICS_ENABLED
+    
+    if not SUMMARY_COMICS_ENABLED:
+        return None
+    
+    if not LAOZHANG_API_KEY:
+        log.warning("Laozhang API key not configured, skipping comics generation")
+        return None
+    
+    if AsyncOpenAI is None:
+        log.warning("OpenAI package not available, skipping comics generation")
+        return None
+    
+    prompt = (
+        "нужно создать изображение по краткому содержанию чата. "
+        "сделай комикс, удели внимание диалогам и персонажам. "
+        "зрители должны знать кто есть кто. "
+        "принадлежность реплик персонажей должна быть соблюдена.\n\n"
+        f"{text}"
+    )
+    
+    try:
+        client = AsyncOpenAI(
+            api_key=LAOZHANG_API_KEY,
+            base_url=LAOZHANG_API_URL,
+        )
+        
+        response = await client.images.generate(
+            model=LAOZHANG_IMAGE_MODEL,
+            prompt=prompt,
+            size="1152x2048",  # 2K resolution
+            quality="standard",
+            n=1,
+        )
+        
+        image_url = response.data[0].url
+        if not image_url:
+            log.error("Laozhang API returned empty image URL")
+            return None
+        
+        # Download the image
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    log.error("Failed to download image from %s: status=%d", image_url, resp.status)
+                    return None
+                image_bytes = await resp.read()
+        
+        await client.close()
+        return image_bytes
+        
+    except Exception as exc:
+        log.error("Summary comics generation failed: %s", exc, exc_info=True)
+        return None
+
+
 async def _send_summary_text(
     bot,
     chat_id: int,
@@ -408,6 +482,7 @@ async def _send_summary_text(
 
     `edit_message` — если задано, пытаемся `edit_text`, иначе `send_message`.
     Длинные тексты, которые не лезут в edit, переотправляются новым сообщением.
+    Если SUMMARY_COMICS_ENABLED=True, отправляет также картинку-комикс.
     """
     async def _do(parse_mode: Optional[str], payload: str) -> None:
         if edit_message is not None:
@@ -441,6 +516,32 @@ async def _send_summary_text(
         )
 
 
+async def _send_summary_with_comics(
+    bot,
+    chat_id: int,
+    text: str,
+    *,
+    edit_message=None,
+) -> None:
+    """Send summary text and optionally generate and send a comics image."""
+    # First send the text
+    await _send_summary_text(bot, chat_id, text, edit_message=edit_message)
+    
+    # Then generate and send comics image if enabled
+    if SUMMARY_COMICS_ENABLED:
+        try:
+            image_bytes = await generate_summary_comics_image(text)
+            if image_bytes:
+                import io
+                await bot.send_photo(
+                    chat_id,
+                    photo=io.BytesIO(image_bytes),
+                    caption="🎨 Комикс по мотивам чата",
+                )
+        except Exception as exc:
+            log.error("Failed to send summary comics image: %s", exc, exc_info=True)
+
+
 async def _send_auto_summary(
     bot, chat_id: int, messages: list[StoredMessage]
 ) -> None:
@@ -457,7 +558,7 @@ async def _send_auto_summary(
             exc_info=True,
         )
         return
-    await _send_summary_text(bot, chat_id, text)
+    await _send_summary_with_comics(bot, chat_id, text)
 
 
 # ─────────────────────────── middleware ──────────────────────────────────
@@ -484,6 +585,45 @@ class MessageHistoryMiddleware(BaseMiddleware):
 # ─────────────────────────── router / handlers ───────────────────────────
 
 router = Router(name="summary")
+
+
+# ─────────────── /summarycomics command ──────────────────────────
+
+@router.message(Command("summarycomics"))
+async def cmd_summary_comics(message: Message) -> None:
+    """Toggle or set summary comics generation.
+    
+    Usage: /summarycomics <0 или 1>
+    """
+    global SUMMARY_COMICS_ENABLED
+    
+    user_id = message.from_user.id if message.from_user else None
+    log.info(
+        "Summary comics toggle requested chat_id=%s user_id=%s",
+        message.chat.id, user_id,
+    )
+    
+    args = message.text.split()
+    if len(args) == 1:
+        comics_status = "включено" if SUMMARY_COMICS_ENABLED else "выключено"
+        await message.reply(
+            f"Генерация комиксов: {comics_status}.\n"
+            "Использование: /summarycomics <0 или 1>"
+        )
+        return
+    
+    if len(args) != 2 or args[1].strip() not in {"0", "1"}:
+        comics_status = "включено" if SUMMARY_COMICS_ENABLED else "выключено"
+        await message.reply(
+            f"Генерация комиксов: {comics_status}.\n"
+            "Использование: /summarycomics <0 или 1>"
+        )
+        return
+    
+    SUMMARY_COMICS_ENABLED = args[1].strip() == "1"
+    comics_status = "включена" if SUMMARY_COMICS_ENABLED else "выключена"
+    log.info("Summary comics set to %s by user_id=%s", SUMMARY_COMICS_ENABLED, user_id)
+    await message.reply(f"Генерация комиксов {comics_status}.")
 
 
 @router.message(
@@ -539,4 +679,4 @@ async def cmd_summary(message: Message) -> None:
     async with history.lock:
         history.messages.clear()
 
-    await _send_summary_text(message.bot, chat_id, text, edit_message=status)
+    await _send_summary_with_comics(message.bot, chat_id, text, edit_message=status)

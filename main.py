@@ -1962,6 +1962,7 @@ GROUP_COMMANDS: list[BotCommand] = [
     BotCommand(command="voice", description="Расшифровать голосовое сообщение (ответом на него)"),
     BotCommand(command="voiceauto", description="Включить/выключить авто-расшифровку голосовых"),
     BotCommand(command="summary", description="Краткое содержание последних сообщений чата"),
+    BotCommand(command="summarycomics", description="Включить/выключить генерацию комикса после саммари"),
     BotCommand(command="info", description="Информация о боте и статусе"),
     BotCommand(command="echo", description="Повторить ваше сообщение"),
 ]
