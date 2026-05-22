@@ -446,7 +446,6 @@ async def generate_summary_comics_image(text: str) -> Optional[bytes]:
             model=LAOZHANG_IMAGE_MODEL,
             prompt=prompt,
             size="1152x2048",  # 2K resolution
-            quality="standard",
             n=1,
         )
         
