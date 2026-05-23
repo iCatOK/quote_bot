@@ -757,5 +757,7 @@ async def cmd_summary(message: Message) -> None:
     # Очищаем буфер только после успешной генерации.
     async with history.lock:
         history.messages.clear()
+        # Синхронизируем очищенное состояние с Supabase
+        save_histories_to_file()
 
     await _send_summary_with_comics(message.bot, chat_id, text, edit_message=status)
