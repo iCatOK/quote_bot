@@ -1,7 +1,8 @@
-"""Daily-style chat summarisation feature backed by AIHubMix LLM."""
+"""Daily-style chat summarisation feature backed by Laozhang MiniMax-M2.7 LLM."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections import defaultdict
@@ -20,7 +21,12 @@ except ImportError:  # pragma: no cover - optional dep at import time
 
 import aiohttp
 
-# Laozhang API configuration for gpt-image-2
+# Laozhang API configuration for summaries
+LAOZHANG_API_KEY_SUMMARIES = os.getenv("LAOZHANG_API_KEY_SUMMARIES", "")
+LAOZHANG_API_URL_SUMMARIES = "https://api.laozhang.ai/v1"
+LAOZHANG_SUMMARY_MODEL = "MiniMax-M2.7"
+
+# Laozhang API configuration for gpt-image-2 (comics generation)
 LAOZHANG_API_KEY = os.getenv("LAOZHANG_API_KEY", "")
 LAOZHANG_API_URL = "https://api.laozhang.ai/v1"
 LAOZHANG_IMAGE_MODEL = "gpt-image-2"
@@ -31,13 +37,8 @@ SUMMARY_COMICS_ENABLED = False
 
 log = logging.getLogger("quote_bot.summary")
 
-# AIHubMix — OpenAI-совместимый агрегатор. Используем стандартный SDK openai,
-# указывая ему base_url AIHubMix.
-AI_HUB_MIX_API_KEY = os.environ.get("AI_HUB_MIX_API_KEY")
-AI_HUB_MIX_BASE_URL = os.environ.get(
-    "AI_HUB_MIX_BASE_URL", "https://aihubmix.com/v1"
-)
-AI_HUB_MIX_MODEL = os.environ.get("AI_HUB_MIX_MODEL", "gpt-5.5-free")
+# Supabase-based history cache configuration
+SUMMARY_CACHE_PATH = "summary_cache/chat_histories.json"
 
 # Если новое сообщение приходит позже, чем `SUMMARY_AUTO_TRIGGER_DELTA`
 # после последнего вызова /summary — автоматически суммаризируем буфер,
@@ -67,7 +68,7 @@ SYSTEM_PROMPT = (
     "сообщений: ориентируйся на общий смысл и помни, что человек говорил голосом, "
     "а не печатал.\n\n"
     "Как писать:\n"
-    "- Живой разговорный язык. Короткие фразы. Можно неполные предложения — "
+    "- Живой разговорный, преимущественно русский, язык. Короткие фразы. Можно неполные предложения — "
     "как в обычной речи. Можно начать с «ну», «короче», «в общем», если по делу.\n"
     "- Никакого канцелярита и пресс-релизного тона: забудь про «осуществили "
     "обсуждение», «было принято решение», «участники затронули тему». Просто "
@@ -109,7 +110,7 @@ SYSTEM_PROMPT = (
     "  Пример со списком: `1\\. первое  2\\. второе`\n"
     "- Внутри `*...*` и `_..._` правила экранирования те же.\n"
     "- Никаких `**жирный**`, `##заголовков`, HTML-тегов — это не MarkdownV2.\n"
-    "- Эмодзи экранировать не нужно."
+    "- Эмодзи экранировать не нужно.\n"
 )
 
 
@@ -134,6 +135,79 @@ class ChatHistory:
 
 
 _histories: dict[int, ChatHistory] = defaultdict(ChatHistory)
+
+
+# ─────────────────────────── Supabase-based history cache ──────────────────
+
+def _get_supabase_text_helpers():
+    """Import supabase text helpers from main module."""
+    from main import supabase_upload_text, supabase_download_text
+    return supabase_upload_text, supabase_download_text
+
+
+def _serialize_history(history: ChatHistory) -> dict:
+    """Serialize a ChatHistory to a dict for JSON storage."""
+    return {
+        "messages": [
+            {
+                "user_id": m.user_id,
+                "full_name": m.full_name,
+                "text": m.text,
+                "date": m.date.isoformat(),
+                "message_id": m.message_id,
+                "reply_to_message_id": m.reply_to_message_id,
+                "is_media": m.is_media,
+            }
+            for m in history.messages
+        ],
+        "last_summary_at": history.last_summary_at.isoformat() if history.last_summary_at else None,
+    }
+
+
+def _deserialize_history(data: dict) -> ChatHistory:
+    """Deserialize a dict back to a ChatHistory object."""
+    messages = [
+        StoredMessage(
+            user_id=m["user_id"],
+            full_name=m["full_name"],
+            text=m["text"],
+            date=datetime.fromisoformat(m["date"]),
+            message_id=m.get("message_id"),
+            reply_to_message_id=m.get("reply_to_message_id"),
+            is_media=m.get("is_media", False),
+        )
+        for m in data.get("messages", [])
+    ]
+    last_summary_at = None
+    if data.get("last_summary_at"):
+        last_summary_at = datetime.fromisoformat(data["last_summary_at"])
+    return ChatHistory(messages=messages, last_summary_at=last_summary_at)
+
+
+def save_histories_to_file() -> None:
+    """Save all chat histories to Supabase Storage (mirrors in-memory state)."""
+    try:
+        upload_text, _ = _get_supabase_text_helpers()
+        data = {str(chat_id): _serialize_history(h) for chat_id, h in _histories.items()}
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        upload_text(SUMMARY_CACHE_PATH, content)
+        log.debug("Saved %d chat histories to Supabase at %s", len(data), SUMMARY_CACHE_PATH)
+    except Exception as exc:
+        log.error("Failed to save histories to Supabase: %s", exc, exc_info=True)
+
+
+def load_histories_from_file() -> None:
+    """Load chat histories from Supabase Storage into memory."""
+    try:
+        _, download_text = _get_supabase_text_helpers()
+        content = download_text(SUMMARY_CACHE_PATH)
+        data = json.loads(content)
+        for chat_id_str, history_data in data.items():
+            chat_id = int(chat_id_str)
+            _histories[chat_id] = _deserialize_history(history_data)
+        log.info("Loaded %d chat histories from Supabase at %s", len(data), SUMMARY_CACHE_PATH)
+    except Exception as exc:
+        log.info("No history cache in Supabase or load failed: %s, starting fresh", exc)
 
 
 def _get_history(chat_id: int) -> ChatHistory:
@@ -246,8 +320,8 @@ def _format_messages(messages: list[StoredMessage]) -> str:
 async def _generate_summary(messages: list[StoredMessage]) -> str:
     if AsyncOpenAI is None:
         raise RuntimeError("openai package is not installed")
-    if not AI_HUB_MIX_API_KEY:
-        raise RuntimeError("AI_HUB_MIX_API_KEY is not set")
+    if not LAOZHANG_API_KEY_SUMMARIES:
+        raise RuntimeError("LAOZHANG_API_KEY_SUMMARIES is not set")
 
     # При очень длинной истории берём последние N — приоритет свежему контексту.
     if len(messages) > SUMMARY_MAX_MESSAGES_PER_REQUEST:
@@ -261,12 +335,12 @@ async def _generate_summary(messages: list[StoredMessage]) -> str:
     )
 
     client = AsyncOpenAI(
-        api_key=AI_HUB_MIX_API_KEY,
-        base_url=AI_HUB_MIX_BASE_URL,
+        api_key=LAOZHANG_API_KEY_SUMMARIES,
+        base_url=LAOZHANG_API_URL_SUMMARIES,
     )
     try:
         completion = await client.chat.completions.create(
-            model=AI_HUB_MIX_MODEL,
+            model=LAOZHANG_SUMMARY_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
@@ -279,7 +353,7 @@ async def _generate_summary(messages: list[StoredMessage]) -> str:
     choice = completion.choices[0]
     text = (getattr(choice.message, "content", "") or "").strip()
     if not text:
-        raise RuntimeError("AIHubMix returned empty completion")
+        raise RuntimeError("Laozhang MiniMax returned empty completion")
     return text
 
 
@@ -328,6 +402,9 @@ async def save_message_to_history(message: Message) -> None:
         )
         if len(history.messages) > HISTORY_MAX_MESSAGES:
             history.messages = history.messages[-HISTORY_MAX_MESSAGES:]
+
+        # Save to file after modifying history
+        save_histories_to_file()
 
     if auto_flush:
         asyncio.create_task(
@@ -379,6 +456,9 @@ async def save_transcribed_media(message: Message, transcribed_text: str) -> Non
         )
         if len(history.messages) > HISTORY_MAX_MESSAGES:
             history.messages = history.messages[-HISTORY_MAX_MESSAGES:]
+
+        # Save to file after modifying history
+        save_histories_to_file()
 
     if auto_flush:
         asyncio.create_task(
@@ -641,8 +721,8 @@ async def cmd_summary(message: Message) -> None:
             "❌ Пакет `openai` не установлен на сервере."
         )
         return
-    if not AI_HUB_MIX_API_KEY:
-        await message.reply("❌ `AI_HUB_MIX_API_KEY` не настроен.")
+    if not LAOZHANG_API_KEY_SUMMARIES:
+        await message.reply("❌ `LAOZHANG_API_KEY_SUMMARIES` не настроен.")
         return
 
     history = _get_history(chat_id)

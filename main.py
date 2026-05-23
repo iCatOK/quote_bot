@@ -42,6 +42,7 @@ from groq import AsyncGroq
 from summary import (
     MessageHistoryMiddleware,
     format_chat_summary_info,
+    load_histories_from_file,
     router as summary_router,
     save_transcribed_media,
 )
@@ -204,6 +205,36 @@ def supabase_delete_image(storage_path: str) -> None:
     except Exception as exc:
         log.error("Supabase delete failed (%s): %s", storage_path, exc)
         raise
+
+
+def supabase_upload_text(storage_path: str, content: str) -> None:
+    """
+    Upload text content to Supabase Storage.
+    storage_path — путь внутри бакета.
+    """
+    def _do():
+        _supabase_client.storage.from_(SUPABASE_BUCKET).upload(
+            path=storage_path,
+            file=content.encode("utf-8"),
+            file_options={"content-type": "application/json", "upsert": "true"},
+        )
+
+    _supabase_retry(_do)
+    log.info("Supabase: uploaded text to %s", storage_path)
+
+
+def supabase_download_text(storage_path: str) -> str:
+    """
+    Download text content from Supabase Storage.
+    Returns the content as string.
+    """
+    def _do() -> str:
+        data: bytes = _supabase_client.storage.from_(SUPABASE_BUCKET).download(storage_path)
+        return data.decode("utf-8")
+
+    content = _supabase_retry(_do)
+    log.info("Supabase: downloaded text from %s", storage_path)
+    return content
 
 
 def supabase_image_exists(storage_path: str) -> bool:
@@ -1990,6 +2021,7 @@ async def on_startup(bot: Bot) -> None:
     log.info("Initial RSS: %.1f MB", _get_rss_mb())
     log.info("supports_inline_queries=%s", getattr(me, "supports_inline_queries", None))
     await _setup_bot_commands(bot)
+    load_histories_from_file()
 
 
 async def on_startup_webhook(bot: Bot) -> None:
@@ -2000,6 +2032,7 @@ async def on_startup_webhook(bot: Bot) -> None:
     log.info("supports_inline_queries=%s", getattr(me, "supports_inline_queries", None))
 
     await _setup_bot_commands(bot)
+    load_histories_from_file()
 
     if WEBHOOK_URL:
         await bot.set_webhook(
