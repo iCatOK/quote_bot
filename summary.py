@@ -16,8 +16,8 @@ from aiogram.types import Message, TelegramObject
 
 try:
     from openai import AsyncOpenAI
-except ImportError:  # pragma: no cover - optional dep at import time
-    AsyncOpenAI = None  # type: ignore[assignment]
+except ImportError:
+    AsyncOpenAI = None
 
 import aiohttp
 
