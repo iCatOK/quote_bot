@@ -24,7 +24,7 @@ import aiohttp
 # Laozhang API configuration for summaries
 LAOZHANG_API_KEY_SUMMARIES = os.getenv("LAOZHANG_API_KEY_SUMMARIES", "")
 LAOZHANG_API_URL_SUMMARIES = "https://api.laozhang.ai/v1"
-LAOZHANG_SUMMARY_MODEL = "MiniMax-M2.7"
+LAOZHANG_SUMMARY_MODEL = "deepseek-v3.2"
 
 # Laozhang API configuration for gpt-image-2 (comics generation)
 LAOZHANG_API_KEY = os.getenv("LAOZHANG_API_KEY", "")
@@ -32,7 +32,7 @@ LAOZHANG_API_URL = "https://api.laozhang.ai/v1"
 LAOZHANG_IMAGE_MODEL = "gpt-image-2"
 
 # Global setting for summary comics generation
-SUMMARY_COMICS_ENABLED = False
+SUMMARY_COMICS_ENABLED = True
 
 
 log = logging.getLogger("quote_bot.summary")
@@ -525,11 +525,23 @@ async def generate_summary_comics_image(text: str) -> Optional[bytes]:
         response = await client.images.generate(
             model=LAOZHANG_IMAGE_MODEL,
             prompt=prompt,
-            size="1152x2048",  # 2K resolution
+            quality="high",
+            size="auto",  # 2K resolution
             n=1,
+            response_format="url"
         )
+
+        if not hasattr(response, "data") or response.data is None:
+            raise RuntimeError(f"Response.data is None or missing. Full response: {response}")     
         
-        image_url = response.data[0].url
+        if len(response.data) == 0:
+            raise RuntimeError(f"Response.data is empty. Full response: {response}")
+        
+        first_item = response.data[0]
+        if first_item is None:
+            raise RuntimeError(f"Response.data[0] is None. Full response: {response}")
+        
+        image_url = first_item.url
         if not image_url:
             log.error("Laozhang API returned empty image URL")
             return None
