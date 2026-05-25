@@ -106,6 +106,7 @@ SYSTEM_PROMPT = (
     "- Моноширинный (для ников/команд/коротких цитат при желании): `` `текст` ``.\n"
     "- В обычном тексте ОБЯЗАТЕЛЬНО экранируй обратной косой чертой следующие "
     "символы: `_ * [ ] ( ) ~ \\` `>` `#` `+` `-` `=` `|` `{` `}` `.` `!`.\n"
+    "  ВАЖНО: Экранируй дефис `-` как `\\-`.\n"
     "  Пример правильного экранирования: `Алиса сказала: всё ок\\. И ушла спать\\!`\n"
     "  Пример со списком: `1\\. первое  2\\. второе`\n"
     "- Внутри `*...*` и `_..._` правила экранирования те же.\n"
@@ -354,6 +355,8 @@ async def _generate_summary(messages: list[StoredMessage]) -> str:
     text = (getattr(choice.message, "content", "") or "").strip()
     if not text:
         raise RuntimeError("Laozhang MiniMax returned empty completion")
+    # Экранируем MarkdownV2 символы в сгенерированном тексте
+    text = _escape_markdown_v2(text)
     return text
 
 
@@ -467,6 +470,13 @@ async def save_transcribed_media(message: Message, transcribed_text: str) -> Non
 
 
 _MARKDOWN_V2_SPECIAL_CHARS = r"_*[]()~`>#+-=|{}.!\\"
+
+
+def _escape_markdown_v2(text: str) -> str:
+    """Экранирует символы для MarkdownV2."""
+    for char in _MARKDOWN_V2_SPECIAL_CHARS:
+        text = text.replace(char, f"\\{char}")
+    return text
 
 
 def _strip_md_v2_escapes(text: str) -> str:
