@@ -24,7 +24,7 @@ import aiohttp
 # Laozhang API configuration for summaries
 LAOZHANG_API_KEY_SUMMARIES = os.getenv("LAOZHANG_API_KEY_SUMMARIES", "")
 LAOZHANG_API_URL_SUMMARIES = "https://api.laozhang.ai/v1"
-LAOZHANG_SUMMARY_MODEL = "deepseek-v3.2"
+LAOZHANG_SUMMARY_MODEL = "gemini-3.1-flash-lite"
 
 # Laozhang API configuration for gpt-image-2 (comics generation)
 LAOZHANG_API_KEY = os.getenv("LAOZHANG_API_KEY", "")
@@ -622,10 +622,10 @@ async def _send_summary_with_comics(
         try:
             image_bytes = await generate_summary_comics_image(text)
             if image_bytes:
-                import io
+                from aiogram.types import BufferedInputFile
                 await bot.send_photo(
                     chat_id,
-                    photo=io.BytesIO(image_bytes),
+                    photo=BufferedInputFile(image_bytes, filename="comics.jpg"),
                     caption="🎨 Комикс по мотивам чата",
                 )
         except Exception as exc:
