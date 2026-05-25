@@ -23,7 +23,10 @@
 			],
 			"cwd": "D:\\DEV\\проекты\\telegram_bots\\quote_bot",
 			"alwaysAllow": [
-				"codegraph_context"
+				"codegraph_context",
+				"codegraph_search",
+				"codegraph_node",
+				"codegraph_callers"
 			]
 		}
 	}
