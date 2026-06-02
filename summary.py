@@ -34,7 +34,6 @@ LAOZHANG_IMAGE_MODEL = "gpt-image-2"
 # Global setting for summary comics generation
 SUMMARY_COMICS_ENABLED = True
 
-
 log = logging.getLogger("quote_bot.summary")
 
 # Supabase-based history cache configuration
@@ -357,7 +356,6 @@ async def _generate_summary(messages: list[StoredMessage]) -> str:
         raise RuntimeError("Laozhang MiniMax returned empty completion")
     return text
 
-
 async def save_message_to_history(message: Message) -> None:
     """Сохранить сообщение в буфер истории чата.
 
@@ -490,8 +488,11 @@ def _strip_md_v2_escapes(text: str) -> str:
     return "".join(out)
 
 
-async def generate_summary_comics_image(text: str) -> Optional[bytes]:
+async def generate_summary_comics_image(text: str, dialogue: str = "") -> Optional[bytes]:
     """Generate a comic-style image from summary text using Laozhang gpt-image-2 API.
+    
+    `text` — summary text (guides visual scene composition).
+    `dialogue` — raw chat messages (provides exact quotes for speech bubbles).
     
     Returns bytes of the generated image or None if generation fails.
     Resolution: 2K, aspect ratio: auto.
@@ -509,12 +510,19 @@ async def generate_summary_comics_image(text: str) -> Optional[bytes]:
         log.warning("OpenAI package not available, skipping comics generation")
         return None
     
-    prompt = (
-        "Создай коминкс по краткому содержанию чата."
-        "Стиль: яркий, динамичный, с выразительной мимикой персонажей."
-        "Принадлежность реплик персонажей должна быть соблюдена.\n\n"
-        f"{text}"
-    )
+    prompt_parts = [
+        "Нарисуй комикс по следующему краткому содержанию чата.",
+        "Стиль: яркий, динамичный, с выразительной мимикой персонажей и диалоговыми пузырями.\n",
+        "Краткое содержание:",
+        text,
+    ]
+    if dialogue:
+        prompt_parts.extend([
+            "",
+            "Реальные реплики из переписки (строго используй их для диалогов в пузырях, не меняй формулировки, не путай говорящих):",
+            dialogue,
+        ])
+    prompt = "\n".join(prompt_parts)
     
     try:
         client = AsyncOpenAI(
@@ -613,15 +621,21 @@ async def _send_summary_with_comics(
     text: str,
     *,
     edit_message=None,
+    messages: Optional[list[StoredMessage]] = None,
 ) -> None:
-    """Send summary text and optionally generate and send a comics image."""
+    """Send summary text and optionally generate and send a comics image.
+    
+    If `messages` is provided and SUMMARY_COMICS_ENABLED is True, generates
+    a comic script from the chat history first, then renders the image.
+    """
     # First send the text
     await _send_summary_text(bot, chat_id, text, edit_message=edit_message)
     
     # Then generate and send comics image if enabled
-    if SUMMARY_COMICS_ENABLED:
+    if SUMMARY_COMICS_ENABLED and messages:
         try:
-            image_bytes = await generate_summary_comics_image(text)
+            dialogue = _format_messages(messages)
+            image_bytes = await generate_summary_comics_image(text, dialogue=dialogue)
             if image_bytes:
                 from aiogram.types import BufferedInputFile
                 await bot.send_photo(
@@ -649,7 +663,7 @@ async def _send_auto_summary(
             exc_info=True,
         )
         return
-    await _send_summary_with_comics(bot, chat_id, text)
+    await _send_summary_with_comics(bot, chat_id, text, messages=messages)
 
 
 # ─────────────────────────── middleware ──────────────────────────────────
@@ -772,4 +786,4 @@ async def cmd_summary(message: Message) -> None:
         # Синхронизируем очищенное состояние с Supabase
         save_histories_to_file()
 
-    await _send_summary_with_comics(message.bot, chat_id, text, edit_message=status)
+    await _send_summary_with_comics(message.bot, chat_id, text, edit_message=status, messages=msgs)
