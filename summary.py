@@ -32,7 +32,9 @@ LAOZHANG_API_URL = "https://api.laozhang.ai/v1"
 LAOZHANG_IMAGE_MODEL = "gpt-image-2"
 
 # Global setting for summary comics generation
-SUMMARY_COMICS_ENABLED = True
+SUMMARY_COMICS_ENABLED = False
+# Global setting for auto-summary toggle
+SUMMARY_AUTO_ENABLED = False
 
 log = logging.getLogger("quote_bot.summary")
 
@@ -292,12 +294,14 @@ def format_chat_summary_info(chat_id: int) -> str:
         last_line = f"{absolute} ({_format_relative_delta(delta)})"
 
     comics_status = "включено" if SUMMARY_COMICS_ENABLED else "выключено"
+    auto_status = "включено" if SUMMARY_AUTO_ENABLED else "выключено"
     return (
         "🧾 Саммаризация:"
         f"\nСообщений в буфере: {messages_count}"
         f"\nПримерно токенов в промпте: ~{tokens_estimate}"
         f"\nПоследний вызов /summary: {last_line}"
         f"\nГенерация комиксов: {comics_status}"
+        f"\nАвто-саммари: {auto_status}"
     )
 
 
@@ -380,7 +384,8 @@ async def save_message_to_history(message: Message) -> None:
     auto_flush: list[StoredMessage] | None = None
     async with history.lock:
         if (
-            history.last_summary_at is not None
+            SUMMARY_AUTO_ENABLED
+            and history.last_summary_at is not None
             and history.messages
             and msg_date - history.last_summary_at > SUMMARY_AUTO_TRIGGER_DELTA
         ):
@@ -435,7 +440,8 @@ async def save_transcribed_media(message: Message, transcribed_text: str) -> Non
     auto_flush: list[StoredMessage] | None = None
     async with history.lock:
         if (
-            history.last_summary_at is not None
+            SUMMARY_AUTO_ENABLED
+            and history.last_summary_at is not None
             and history.messages
             and msg_date - history.last_summary_at > SUMMARY_AUTO_TRIGGER_DELTA
         ):
@@ -724,6 +730,45 @@ async def cmd_summary_comics(message: Message) -> None:
     comics_status = "включена" if SUMMARY_COMICS_ENABLED else "выключена"
     log.info("Summary comics set to %s by user_id=%s", SUMMARY_COMICS_ENABLED, user_id)
     await message.reply(f"Генерация комиксов {comics_status}.")
+
+
+# ─────────────── /autosummary command ──────────────────────────
+
+@router.message(Command("autosummary"))
+async def cmd_autosummary(message: Message) -> None:
+    """Toggle or set auto-summary mode.
+
+    Usage: /autosummary <0 или 1>
+    """
+    global SUMMARY_AUTO_ENABLED
+
+    user_id = message.from_user.id if message.from_user else None
+    log.info(
+        "Auto-summary toggle requested chat_id=%s user_id=%s",
+        message.chat.id, user_id,
+    )
+
+    args = message.text.split()
+    if len(args) == 1:
+        auto_status = "включено" if SUMMARY_AUTO_ENABLED else "выключено"
+        await message.reply(
+            f"Авто-саммари: {auto_status}.\n"
+            "Использование: /autosummary <0 или 1>"
+        )
+        return
+
+    if len(args) != 2 or args[1].strip() not in {"0", "1"}:
+        auto_status = "включено" if SUMMARY_AUTO_ENABLED else "выключено"
+        await message.reply(
+            f"Авто-саммари: {auto_status}.\n"
+            "Использование: /autosummary <0 или 1>"
+        )
+        return
+
+    SUMMARY_AUTO_ENABLED = args[1].strip() == "1"
+    auto_status = "включена" if SUMMARY_AUTO_ENABLED else "выключена"
+    log.info("Auto-summary set to %s by user_id=%s", SUMMARY_AUTO_ENABLED, user_id)
+    await message.reply(f"Авто-саммари {auto_status}.")
 
 
 @router.message(
